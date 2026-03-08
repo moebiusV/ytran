@@ -1,6 +1,7 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/* Copyright (c) 2026 David Walther */
 /*
  * ytran - YouTube transcript fetcher and summarizer
- * BSD 2-Clause License - see COPYING
  */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -13,7 +14,7 @@
 #include <getopt.h>
 #include <curl/curl.h>
 #include <sqlite3.h>
-#include "deps/cjson/cJSON.h"
+#include <cjson/cJSON.h>
 
 /* ── Types ── */
 
@@ -876,27 +877,32 @@ int main(int argc, char **argv)
 	const char *skip_str = NULL;
 
 	static struct option longopts[] = {
-		{"browse", no_argument, NULL, 'b'},
-		{"fix",    no_argument, NULL, 'f'},
-		{"model",  required_argument, NULL, 'm'},
-		{"skip",   required_argument, NULL, 's'},
-		{"help",   no_argument, NULL, 'h'},
+		{"browse",  no_argument, NULL, 'b'},
+		{"fix",     no_argument, NULL, 'f'},
+		{"model",   required_argument, NULL, 'm'},
+		{"skip",    required_argument, NULL, 's'},
+		{"help",    no_argument, NULL, 'h'},
+		{"version", no_argument, NULL, 'V'},
 		{NULL, 0, NULL, 0}
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "bfm:s:h", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "bfm:s:hV", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'b': browse = true; break;
 		case 'f': fix = true; break;
 		case 'm': model = optarg; break;
 		case 's': skip_str = optarg; break;
+		case 'V':
+			printf("ytran 1.0\n");
+			return 0;
 		case 'h':
 			printf("Usage: ytran [OPTIONS] [VIDEO_URL_OR_ID]\n"
 			       "  --browse        Browse the transcript database\n"
 			       "  --fix           Fill in missing fields\n"
 			       "  --model MODEL   Claude model [%s]\n"
-			       "  --skip IDs      Comma-separated video IDs to skip\n", model);
+			       "  --skip IDs      Comma-separated video IDs to skip\n"
+			       "  --version       Show version\n", model);
 			return 0;
 		default: return 1;
 		}
@@ -913,8 +919,8 @@ int main(int argc, char **argv)
 	free(xdg);
 
 	if (browse) {
-		execlp("bs3", "bs3", db_file, "videos", (char *)NULL);
-		perror("bs3");
+		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos", (char *)NULL);
+		perror("browse-sqlite3");
 		return 1;
 	}
 
@@ -931,8 +937,14 @@ int main(int argc, char **argv)
 	transcript_api_key = read_file_trimmed(path);
 	snprintf(path, sizeof(path), "%s/.anthropic_api_key", home);
 	anthropic_api_key = read_file_trimmed(path);
-	if (!transcript_api_key || !anthropic_api_key) {
-		fprintf(stderr, "Error: API key file(s) not found\n");
+	if (!transcript_api_key) {
+		fprintf(stderr, "Error: %s/.youtubetotranscript_api_key not found\n", home);
+		fprintf(stderr, "Get a key at https://transcriptapi.com and save it to that file.\n");
+		return 1;
+	}
+	if (!anthropic_api_key) {
+		fprintf(stderr, "Error: %s/.anthropic_api_key not found\n", home);
+		fprintf(stderr, "Get a key at https://console.anthropic.com/settings/keys and save it to that file.\n");
 		return 1;
 	}
 

@@ -6,3 +6,5 @@ venv/
 .venv/
 *.db
 Makefile
+src/ytran
+*.tar.gz

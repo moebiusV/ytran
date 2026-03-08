@@ -1,20 +1,31 @@
 PREFIX = @PREFIX@
 CC = @CC@
-CFLAGS = -std=c17 -Wall -Wextra -O2
-LDLIBS = -Wl,-Bstatic -lsqlite3 -Wl,-Bdynamic -lcurl -lpthread -ldl -lm
+CFLAGS = @CFLAGS@ -std=c17
+LDFLAGS = @LDFLAGS@
+CPPFLAGS = @CPPFLAGS@
+CJSON_SRC = @CJSON_SRC@
+CJSON_CFLAGS = @CJSON_CFLAGS@
+CJSON_LIBS = @CJSON_LIBS@
+CURL_CFLAGS = @CURL_CFLAGS@
+CURL_LIBS = @CURL_LIBS@
+SQLITE_CFLAGS = @SQLITE_CFLAGS@
+SQLITE_LIBS = @SQLITE_LIBS@
 BINDIR = $(PREFIX)/bin
 MANDIR = $(PREFIX)/share/man/man1
 
+ALL_CFLAGS = $(CPPFLAGS) $(CFLAGS) $(CURL_CFLAGS) $(SQLITE_CFLAGS) $(CJSON_CFLAGS)
+ALL_LIBS = $(CURL_LIBS) $(SQLITE_LIBS) $(CJSON_LIBS) -lpthread -ldl -lm
+
 .PHONY: all install uninstall clean distclean check dist
 
-all: c/ytran
+all: src/ytran
 
-c/ytran: c/ytran.c c/deps/cjson/cJSON.c
-	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ c/ytran.c c/deps/cjson/cJSON.c $(LDLIBS)
+src/ytran: src/ytran.c $(CJSON_SRC)
+	$(CC) $(ALL_CFLAGS) $(LDFLAGS) -o $@ src/ytran.c $(CJSON_SRC) $(ALL_LIBS)
 
-install: c/ytran
+install: src/ytran
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 755 c/ytran $(DESTDIR)$(BINDIR)/ytran
+	install -m 755 src/ytran $(DESTDIR)$(BINDIR)/ytran
 	install -d $(DESTDIR)$(MANDIR)
 	install -m 644 ytran.1 $(DESTDIR)$(MANDIR)/ytran.1
 
@@ -23,18 +34,23 @@ uninstall:
 	rm -f $(DESTDIR)$(MANDIR)/ytran.1
 
 clean:
-	rm -f c/ytran
+	rm -f src/ytran
 
 distclean: clean
 	rm -f Makefile
 
-check: c/ytran
-	@echo "Build OK."
+check: src/ytran
+	@src/ytran --version
+	@src/ytran --help >/dev/null
+	@echo "All checks passed."
 
 dist:
-	mkdir -p ytran-1.0
-	cp configure Makefile.in requirements.txt ytran.py ytran-1.0/
-	cp -r c ytran-1.0/
+	rm -rf ytran-1.0
+	mkdir -p ytran-1.0/src/deps/cjson ytran-1.0/contrib
+	cp configure Makefile.in requirements.txt ytran-1.0/
+	cp contrib/ytran.py ytran-1.0/contrib/
+	cp src/ytran.c ytran-1.0/src/
+	cp src/deps/cjson/cJSON.c src/deps/cjson/cJSON.h ytran-1.0/src/deps/cjson/
 	cp README.md COPYING AUTHORS NEWS ChangeLog INSTALL ytran.1 ytran-1.0/
 	tar czf ytran-1.0.tar.gz ytran-1.0
 	rm -rf ytran-1.0

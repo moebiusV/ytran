@@ -1,51 +1,115 @@
 #!/bin/sh
 # configure script for ytran
 
+set -e
+
 PREFIX=/usr/local
-CC=${CC:-cc}
+CC="${CC:-cc}"
+USE_BUNDLED_CJSON=auto
 
 for arg in "$@"; do
     case "$arg" in
-        --prefix=*) PREFIX="${arg#--prefix=}" ;;
+        --prefix=*)          PREFIX="${arg#--prefix=}" ;;
+        --with-bundled-cjson) USE_BUNDLED_CJSON=yes ;;
+        --build=*|--host=*|--target=*) ;; # accepted for cross-compilation compat
         --help)
-            echo "Usage: ./configure [OPTIONS]"
-            echo ""
-            echo "  --prefix=DIR   Installation prefix [/usr/local]"
-            echo ""
+            cat <<EOF
+Usage: ./configure [OPTIONS]
+
+  --prefix=DIR            Installation prefix [/usr/local]
+  --with-bundled-cjson    Use vendored cJSON instead of system libcjson
+
+Environment variables:
+  CC        C compiler [cc]
+  CFLAGS    Compiler flags [-O2 -Wall -Wextra]
+  LDFLAGS   Linker flags
+  CPPFLAGS  Preprocessor flags
+EOF
             exit 0
             ;;
-        *) echo "Unknown option: $arg"; exit 1 ;;
+        *)
+            echo "warning: unrecognized option: $arg" >&2
+            ;;
     esac
 done
 
 # Check C compiler
 if ! command -v "$CC" >/dev/null 2>&1; then
-    echo "Error: C compiler '$CC' not found"
+    echo "error: C compiler '$CC' not found" >&2
     exit 1
 fi
+echo "checking for C compiler... $CC"
 
 # Check required libraries
 MISSING=""
 for lib in libcurl sqlite3; do
-    if ! pkg-config --exists "$lib" 2>/dev/null; then
+    if pkg-config --exists "$lib" 2>/dev/null; then
+        echo "checking for $lib... yes"
+    else
         MISSING="$MISSING $lib"
     fi
 done
 
 if [ -n "$MISSING" ]; then
-    echo "Missing libraries:$MISSING"
+    echo "error: missing libraries:$MISSING" >&2
     echo ""
     echo "Install with:"
     echo "  sudo apt-get install libcurl4-openssl-dev libsqlite3-dev"
     exit 1
 fi
 
-echo "CC:      $CC"
-echo "Prefix:  $PREFIX"
+# Check for cJSON
+CJSON_SRC=""
+CJSON_CFLAGS=""
+CJSON_LIBS=""
+
+if [ "$USE_BUNDLED_CJSON" != "yes" ]; then
+    if pkg-config --exists libcjson 2>/dev/null; then
+        CJSON_CFLAGS=$(pkg-config --cflags libcjson)
+        CJSON_LIBS=$(pkg-config --libs libcjson)
+        echo "checking for system cJSON... yes"
+    else
+        USE_BUNDLED_CJSON=yes
+    fi
+fi
+
+if [ "$USE_BUNDLED_CJSON" = "yes" ]; then
+    if [ ! -f src/deps/cjson/cJSON.c ]; then
+        echo "error: vendored cJSON not found at src/deps/cjson/cJSON.c" >&2
+        exit 1
+    fi
+    CJSON_SRC="src/deps/cjson/cJSON.c"
+    CJSON_CFLAGS="-Isrc/deps"
+    echo "using bundled cJSON"
+fi
+
+# Honor environment flags, provide defaults
+: "${CFLAGS:=-O2 -Wall -Wextra}"
+
+CURL_CFLAGS=$(pkg-config --cflags libcurl 2>/dev/null || true)
+CURL_LIBS=$(pkg-config --libs libcurl 2>/dev/null || echo "-lcurl")
+SQLITE_CFLAGS=$(pkg-config --cflags sqlite3 2>/dev/null || true)
+SQLITE_LIBS=$(pkg-config --libs sqlite3 2>/dev/null || echo "-lsqlite3")
+
+echo ""
+echo "  prefix:  $PREFIX"
+echo "  CC:      $CC"
+echo "  CFLAGS:  $CFLAGS"
+echo "  cJSON:   $([ -n "$CJSON_SRC" ] && echo "bundled" || echo "system")"
+echo ""
 
 sed -e "s|@PREFIX@|$PREFIX|g" \
     -e "s|@CC@|$CC|g" \
+    -e "s|@CFLAGS@|$CFLAGS|g" \
+    -e "s|@LDFLAGS@|${LDFLAGS:-}|g" \
+    -e "s|@CPPFLAGS@|${CPPFLAGS:-}|g" \
+    -e "s|@CJSON_SRC@|$CJSON_SRC|g" \
+    -e "s|@CJSON_CFLAGS@|$CJSON_CFLAGS|g" \
+    -e "s|@CJSON_LIBS@|$CJSON_LIBS|g" \
+    -e "s|@CURL_CFLAGS@|$CURL_CFLAGS|g" \
+    -e "s|@CURL_LIBS@|$CURL_LIBS|g" \
+    -e "s|@SQLITE_CFLAGS@|$SQLITE_CFLAGS|g" \
+    -e "s|@SQLITE_LIBS@|$SQLITE_LIBS|g" \
     Makefile.in > Makefile
 
-echo ""
 echo "Configuration complete. Run 'make' to build."
