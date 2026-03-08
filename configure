@@ -2,17 +2,15 @@
 # configure script for ytran
 
 PREFIX=/usr/local
-PYTHON=python3
+CC=${CC:-cc}
 
 for arg in "$@"; do
     case "$arg" in
         --prefix=*) PREFIX="${arg#--prefix=}" ;;
-        --with-python=*) PYTHON="${arg#--with-python=}" ;;
         --help)
             echo "Usage: ./configure [OPTIONS]"
             echo ""
-            echo "  --prefix=DIR        Installation prefix [/usr/local]"
-            echo "  --with-python=PATH  Python interpreter [$PYTHON]"
+            echo "  --prefix=DIR   Installation prefix [/usr/local]"
             echo ""
             exit 0
             ;;
@@ -20,26 +18,33 @@ for arg in "$@"; do
     esac
 done
 
-# Check Python
-if ! command -v "$PYTHON" >/dev/null 2>&1; then
-    echo "Error: $PYTHON not found"
+# Check C compiler
+if ! command -v "$CC" >/dev/null 2>&1; then
+    echo "Error: C compiler '$CC' not found"
     exit 1
 fi
 
-PYTHON_VERSION=$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
-MAJOR=$("$PYTHON" -c 'import sys; print(sys.version_info.major)')
-MINOR=$("$PYTHON" -c 'import sys; print(sys.version_info.minor)')
+# Check required libraries
+MISSING=""
+for lib in libcurl sqlite3; do
+    if ! pkg-config --exists "$lib" 2>/dev/null; then
+        MISSING="$MISSING $lib"
+    fi
+done
 
-if [ "$MAJOR" -lt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -lt 8 ]; }; then
-    echo "Error: Python 3.8+ required (found $PYTHON_VERSION)"
+if [ -n "$MISSING" ]; then
+    echo "Missing libraries:$MISSING"
+    echo ""
+    echo "Install with:"
+    echo "  sudo apt-get install libcurl4-openssl-dev libsqlite3-dev"
     exit 1
 fi
 
-echo "Python:  $PYTHON ($PYTHON_VERSION)"
+echo "CC:      $CC"
 echo "Prefix:  $PREFIX"
 
 sed -e "s|@PREFIX@|$PREFIX|g" \
-    -e "s|@PYTHON@|$PYTHON|g" \
+    -e "s|@CC@|$CC|g" \
     Makefile.in > Makefile
 
 echo ""

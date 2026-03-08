@@ -36,7 +36,7 @@ os.makedirs(db_dir, exist_ok=True)
 db_file = os.path.join(db_dir, 'youtube-transcripts.db')
 
 if args.browse:
-    os.execvp('browse-sqlite', ['browse-sqlite', db_file, 'videos'])
+    os.execvp('browse-sqlite3', ['browse-sqlite3', db_file, 'videos'])
 
 if not args.fix and not args.video_url_or_id:
     parser.error("The following arguments are required: video_url_or_id (unless --fix or --browse)")

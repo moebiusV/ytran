@@ -1,16 +1,20 @@
 PREFIX = @PREFIX@
-PYTHON = @PYTHON@
+CC = @CC@
+CFLAGS = -std=c17 -Wall -Wextra -O2
+LDLIBS = -Wl,-Bstatic -lsqlite3 -Wl,-Bdynamic -lcurl -lpthread -ldl -lm
 BINDIR = $(PREFIX)/bin
 MANDIR = $(PREFIX)/share/man/man1
 
 .PHONY: all install uninstall clean distclean check dist
 
-all:
-	@echo "Nothing to build. Run 'make install' to install."
+all: c/ytran
 
-install:
+c/ytran: c/ytran.c c/deps/cjson/cJSON.c
+	$(CC) $(CFLAGS) $(LDFLAGS) -o $@ c/ytran.c c/deps/cjson/cJSON.c $(LDLIBS)
+
+install: c/ytran
 	install -d $(DESTDIR)$(BINDIR)
-	install -m 755 ytran $(DESTDIR)$(BINDIR)/ytran
+	install -m 755 c/ytran $(DESTDIR)$(BINDIR)/ytran
 	install -d $(DESTDIR)$(MANDIR)
 	install -m 644 ytran.1 $(DESTDIR)$(MANDIR)/ytran.1
 
@@ -19,17 +23,18 @@ uninstall:
 	rm -f $(DESTDIR)$(MANDIR)/ytran.1
 
 clean:
+	rm -f c/ytran
 
 distclean: clean
 	rm -f Makefile
 
-check:
-	$(PYTHON) -c "import anthropic" 2>/dev/null || echo "Warning: anthropic package not installed"
-	@echo "Checks passed."
+check: c/ytran
+	@echo "Build OK."
 
 dist:
 	mkdir -p ytran-1.0
-	cp ytran configure Makefile.in requirements.txt ytran-1.0/
+	cp configure Makefile.in requirements.txt ytran.py ytran-1.0/
+	cp -r c ytran-1.0/
 	cp README.md COPYING AUTHORS NEWS ChangeLog INSTALL ytran.1 ytran-1.0/
 	tar czf ytran-1.0.tar.gz ytran-1.0
 	rm -rf ytran-1.0
