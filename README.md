@@ -42,4 +42,4 @@ Stored at `$XDG_DATA_HOME/ytran/youtube-transcripts.db`
 
 ## License
 
-GNU General Public License v3 or later. See [COPYING](COPYING).
+BSD 2-Clause. See [COPYING](COPYING).
