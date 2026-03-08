@@ -1,0 +1,46 @@
+#!/bin/sh
+# configure script for ytran
+
+PREFIX=/usr/local
+PYTHON=python3
+
+for arg in "$@"; do
+    case "$arg" in
+        --prefix=*) PREFIX="${arg#--prefix=}" ;;
+        --with-python=*) PYTHON="${arg#--with-python=}" ;;
+        --help)
+            echo "Usage: ./configure [OPTIONS]"
+            echo ""
+            echo "  --prefix=DIR        Installation prefix [/usr/local]"
+            echo "  --with-python=PATH  Python interpreter [$PYTHON]"
+            echo ""
+            exit 0
+            ;;
+        *) echo "Unknown option: $arg"; exit 1 ;;
+    esac
+done
+
+# Check Python
+if ! command -v "$PYTHON" >/dev/null 2>&1; then
+    echo "Error: $PYTHON not found"
+    exit 1
+fi
+
+PYTHON_VERSION=$("$PYTHON" -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
+MAJOR=$("$PYTHON" -c 'import sys; print(sys.version_info.major)')
+MINOR=$("$PYTHON" -c 'import sys; print(sys.version_info.minor)')
+
+if [ "$MAJOR" -lt 3 ] || { [ "$MAJOR" -eq 3 ] && [ "$MINOR" -lt 8 ]; }; then
+    echo "Error: Python 3.8+ required (found $PYTHON_VERSION)"
+    exit 1
+fi
+
+echo "Python:  $PYTHON ($PYTHON_VERSION)"
+echo "Prefix:  $PREFIX"
+
+sed -e "s|@PREFIX@|$PREFIX|g" \
+    -e "s|@PYTHON@|$PYTHON|g" \
+    Makefile.in > Makefile
+
+echo ""
+echo "Configuration complete. Run 'make' to build."

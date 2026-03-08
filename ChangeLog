@@ -1,0 +1,4 @@
+2026-03-08  David Walther  <david@clearbrookdistillery.com>
+
+	* Initial release as a packaged project.
+	* ytran: YouTube transcript fetcher and summarizer.

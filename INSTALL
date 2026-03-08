@@ -1,0 +1,31 @@
+Installation Instructions
+========================
+
+Prerequisites:
+  - Python 3.8 or later
+  - pip (Python package installer)
+
+Quick install:
+
+  ./configure
+  make
+  make install
+
+This installs ytran to /usr/local/bin by default.  To change the prefix:
+
+  ./configure --prefix=$HOME/.local
+  make
+  make install
+
+To uninstall:
+
+  make uninstall
+
+API Keys:
+
+  ytran expects two API key files:
+
+    ~/.youtubetotranscript_api_key   — transcriptapi.com bearer token
+    ~/.anthropic_api_key             — Anthropic API key
+
+  Create these files before running ytran.

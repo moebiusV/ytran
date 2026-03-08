@@ -1,0 +1,40 @@
+.TH YTRAN 1 "2026-03-08" "ytran 1.0" "User Commands"
+.SH NAME
+ytran \- fetch and summarize YouTube video transcripts
+.SH SYNOPSIS
+.B ytran
+.RI [ OPTIONS ]
+.RI [ VIDEO_URL_OR_ID ]
+.SH DESCRIPTION
+.B ytran
+fetches YouTube video transcripts via transcriptapi.com, formats them
+with Claude, generates summaries, and stores everything in a local
+SQLite database.
+.PP
+When invoked with no arguments, it opens an interactive browser for the
+transcript database.
+.SH OPTIONS
+.TP
+.B \-\-browse
+Open an interactive browser for the transcript database.
+.TP
+.B \-\-fix
+Scan all database entries and fill in any missing fields (metadata,
+transcripts, summaries).
+.TP
+.BI \-\-skip " ID1,ID2,..."
+Comma-separated list of video IDs to skip during \-\-fix operations.
+.SH FILES
+.TP
+.I ~/.local/share/ytran/youtube-transcripts.db
+Default database location (respects $XDG_DATA_HOME).
+.TP
+.I ~/.youtubetotranscript_api_key
+transcriptapi.com bearer token.
+.TP
+.I ~/.anthropic_api_key
+Anthropic API key for Claude.
+.SH AUTHOR
+David Walther <david@clearbrookdistillery.com>
+.SH LICENSE
+GPLv3+: GNU GPL version 3 or later.

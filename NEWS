@@ -1,0 +1,11 @@
+ytran NEWS
+
+2026-03-08  Version 1.0
+
+  * Initial release.
+  * Fetch YouTube transcripts via transcriptapi.com.
+  * Clean and format transcripts with Claude.
+  * Generate short and full summaries.
+  * SQLite database with XDG-compliant storage.
+  * Channel name/handle tracking.
+  * Batch fix mode for backfilling missing fields.

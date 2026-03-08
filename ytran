@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+import sys
+import os
+import re
+import subprocess
+import urllib.request
+import json
+import sqlite3
+from datetime import datetime
+import argparse
+from anthropic import Anthropic
+
+# Function to extract YouTube video ID from URL or ID
+def extract_youtube_id(s):
+    if re.search(r"v=([^&]+)", s):
+        return re.search(r"v=([^&]+)", s).group(1)
+    if re.search(r"youtu\.be/([^?]+)", s):
+        return re.search(r"youtu\.be/([^?]+)", s).group(1)
+    if re.match(r"^[a-zA-Z0-9_-]{11}$", s):
+        return s
+    raise ValueError("Invalid YouTube URL or ID")
+
+# Parse arguments
+parser = argparse.ArgumentParser(description="Fetch YouTube transcript and save to DB")
+parser.add_argument("video_url_or_id", nargs="?", help="YouTube video URL or ID (required unless --fix or --browse)")
+parser.add_argument("--browse", action="store_true", help="Browse the transcript database")
+parser.add_argument("--fix", action="store_true", help="Fill in missing fields in existing DB entries")
+parser.add_argument("--skip", type=str, default="", help="Comma-separated video IDs to skip")
+args = parser.parse_args()
+skip_ids = set(s.strip() for s in args.skip.split(",") if s.strip())
+
+# XDG-compliant database path
+xdg_data_home = os.environ.get('XDG_DATA_HOME', os.path.expanduser('~/.local/share'))
+db_dir = os.path.join(xdg_data_home, 'ytran')
+os.makedirs(db_dir, exist_ok=True)
+db_file = os.path.join(db_dir, 'youtube-transcripts.db')
+
+if args.browse:
+    os.execvp('browse-sqlite', ['browse-sqlite', db_file, 'videos'])
+
+if not args.fix and not args.video_url_or_id:
+    parser.error("The following arguments are required: video_url_or_id (unless --fix or --browse)")
+
+# Read API keys
+try:
+    with open(os.path.expanduser("~/.youtubetotranscript_api_key")) as f:
+        transcript_api_key = f.read().strip()
+    with open(os.path.expanduser("~/.anthropic_api_key")) as f:
+        anthropic_api_key = f.read().strip()
+except FileNotFoundError as e:
+    print(f"Error: API key file not found: {e}")
+    sys.exit(1)
+except Exception as e:
+    print(f"Error reading API key: {e}")
+    sys.exit(1)
+
+# Initialize Anthropic client
+anthropic = Anthropic(api_key=anthropic_api_key)
+
+# Cost tracking  (input $/MTok, cache_write $/MTok, cache_read $/MTok, output $/MTok)
+PRICING = {
+    "claude-opus-4-6":    (5.0, 6.25, 0.50, 25.0),
+    "claude-opus-4-5":    (5.0, 6.25, 0.50, 25.0),
+    "claude-sonnet-4-5":  (3.0, 3.75, 0.30, 15.0),
+    "claude-haiku-4-5":   (1.0, 1.25, 0.10,  5.0),
+}
+total_cost = 0.0
+
+def generate_with_claude(prompt, model="claude-opus-4-6", max_tokens=16000, cached_prefix=None):
+    """Call Claude API. If cached_prefix is provided, it's sent as a cached system message."""
+    global total_cost
+    try:
+        kwargs = dict(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        if cached_prefix:
+            kwargs["system"] = [{"type": "text", "text": cached_prefix, "cache_control": {"type": "ephemeral"}}]
+        message = anthropic.messages.create(**kwargs)
+        usage = message.usage
+        input_tok = usage.input_tokens
+        output_tok = usage.output_tokens
+        cache_write = getattr(usage, 'cache_creation_input_tokens', 0) or 0
+        cache_read = getattr(usage, 'cache_read_input_tokens', 0) or 0
+        p_in, p_cw, p_cr, p_out = PRICING.get(model, (5.0, 6.25, 0.50, 25.0))
+        call_cost = (input_tok * p_in + cache_write * p_cw + cache_read * p_cr + output_tok * p_out) / 1_000_000
+        total_cost += call_cost
+        cache_info = ""
+        if cache_write:
+            cache_info += f", {cache_write} cache_write"
+        if cache_read:
+            cache_info += f", {cache_read} cache_read"
+        print(f"  API: {input_tok} in + {output_tok} out{cache_info} = ${call_cost:.4f} (total: ${total_cost:.4f})")
+        return message.content[0].text
+    except Exception as e:
+        print(f"Error in Anthropic API call: {e}")
+        return ""
+
+def wordwrap(text, width=80):
+    """Wrap text to width at word boundaries using fold -s."""
+    if not text:
+        return text
+    result = subprocess.run(["fold", "-s", "-w", str(width)], input=text, capture_output=True, text=True)
+    return result.stdout
+
+def fetch_youtube_metadata(video_id):
+    try:
+        page = urllib.request.urlopen(
+            urllib.request.Request(
+                f"https://www.youtube.com/watch?v={video_id}",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+            ), timeout=30
+        ).read().decode()
+    except urllib.error.URLError as e:
+        print(f"Error fetching YouTube page: {e}")
+        return None, None, None, None, None, None, None
+
+    title = re.sub(r" - YouTube$", "", re.search(r"<title>([^<]+)", page).group(1).strip()) if re.search(r"<title>([^<]+)", page) else ""
+    upload_date = re.search(r'itemprop="uploadDate" content="([^"]+)', page)
+    upload_date = upload_date.group(1) if upload_date else ""
+    duration = re.search(r'itemprop="duration" content="([^"]+)', page)
+    duration = duration.group(1) if duration else ""
+    # Get full description from ytInitialPlayerResponse JSON (meta tag is truncated to ~160 chars)
+    description = ""
+    player_resp = re.search(r'var ytInitialPlayerResponse\s*=\s*(\{.*?\});', page)
+    if player_resp:
+        try:
+            description = json.loads(player_resp.group(1)).get("videoDetails", {}).get("shortDescription", "")
+        except json.JSONDecodeError:
+            pass
+    if not description:
+        description_match = re.search(r'<meta name="description" content="([^"]+)', page)
+        description = description_match.group(1) if description_match else ""
+    channel_id_match = re.search(r'"browseId":"(UC[a-zA-Z0-9_-]{22})","canonicalBaseUrl":"([^"]*)"', page)
+    channel_id = channel_id_match.group(1) if channel_id_match else ""
+    channel_handle = channel_id_match.group(2).lstrip("/") if channel_id_match else ""  # e.g. @SteakandButterGal
+    channel_name_match = re.search(r'"ownerChannelName":"([^"]+)"', page)
+    channel_name = channel_name_match.group(1) if channel_name_match else ""
+
+    return title, upload_date, duration, description, channel_id, channel_name, channel_handle
+
+def fetch_raw_transcript(video_id):
+    try:
+        response = urllib.request.urlopen(
+            urllib.request.Request(
+                f"https://transcriptapi.com/api/v2/youtube/transcript?video_url={video_id}&format=json",
+                headers={
+                    "Authorization": f"Bearer {transcript_api_key}",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                }
+            ), timeout=30
+        ).read().decode()
+    except urllib.error.HTTPError as e:
+        print(f"Error fetching transcript: HTTP Error {e.code}: {e.reason}")
+        return None, None
+    except urllib.error.URLError as e:
+        print(f"Error fetching transcript: {e}")
+        return None, None
+
+    try:
+        data = json.loads(response)
+    except json.JSONDecodeError as e:
+        print(f"Error parsing transcript JSON: {e}")
+        return None, None
+
+    language = data.get("language", "")
+    segments = data.get("transcript", [])
+    raw_transcript = "\n".join(f"{seg['start']:.2f}: {seg['text']}" for seg in segments)
+
+    return language, raw_transcript
+
+def process_video(video_id, conn):
+    cursor = conn.cursor()
+    cursor.execute("SELECT title, upload_date, duration, description, channel_id, language, raw_transcript, transcript_formatted, summary_short, summary_full, fetched_at FROM videos WHERE video_id = ?", (video_id,))
+    result = cursor.fetchone()
+    if result:
+        title, upload_date, duration, description, channel_id, language, raw_transcript, transcript_formatted, summary_short, summary_full, fetched_at = result
+    else:
+        title, upload_date, duration, description, channel_id, language, raw_transcript, transcript_formatted, summary_short, summary_full, fetched_at = None, None, None, None, None, None, None, None, None, None, None
+
+    fetched_at = datetime.now().isoformat() if not fetched_at else fetched_at
+
+    # Fix metadata if missing
+    channel_name, channel_handle = None, None
+    desc_truncated = description and len(description) <= 200
+    if not title or not upload_date or not duration or not description or not channel_id or desc_truncated:
+        print(f"Fixing metadata for {video_id}")
+        new_title, new_upload_date, new_duration, new_description, new_channel_id, channel_name, channel_handle = fetch_youtube_metadata(video_id)
+        title = title or new_title
+        upload_date = upload_date or new_upload_date
+        duration = duration or new_duration
+        # Replace truncated descriptions with full version
+        if not description or (desc_truncated and new_description and len(new_description) > len(description)):
+            description = new_description
+        channel_id = channel_id or new_channel_id
+
+    # Ensure channel_names is populated for this channel
+    if channel_id:
+        if not channel_name:
+            cursor.execute("SELECT name FROM channel_names WHERE channel_id = ? AND name_type = 'fullname' ORDER BY timestamp DESC LIMIT 1", (channel_id,))
+            row = cursor.fetchone()
+            if not row:
+                print(f"Fetching channel name for {video_id}")
+                _, _, _, _, _, channel_name, channel_handle = fetch_youtube_metadata(video_id)
+        if channel_name:
+            cursor.execute("SELECT name FROM channel_names WHERE channel_id = ? AND name_type = 'fullname' ORDER BY timestamp DESC LIMIT 1", (channel_id,))
+            latest = cursor.fetchone()
+            if not latest or latest[0] != channel_name:
+                conn.execute("INSERT INTO channel_names (channel_id, name_type, name, timestamp) VALUES (?, 'fullname', ?, ?)", (channel_id, channel_name, fetched_at))
+        if channel_handle:
+            cursor.execute("SELECT name FROM channel_names WHERE channel_id = ? AND name_type = 'handle' ORDER BY timestamp DESC LIMIT 1", (channel_id,))
+            latest = cursor.fetchone()
+            if not latest or latest[0] != channel_handle:
+                conn.execute("INSERT INTO channel_names (channel_id, name_type, name, timestamp) VALUES (?, 'handle', ?, ?)", (channel_id, channel_handle, fetched_at))
+
+    # Fix raw transcript if missing
+    if not raw_transcript:
+        print(f"Fixing raw transcript for {video_id}")
+        language, raw_transcript = fetch_raw_transcript(video_id)
+
+    # Build cached prefix from stripped transcript for use across all Claude calls
+    needs_format = not transcript_formatted and raw_transcript
+    needs_full = not summary_full and (transcript_formatted or needs_format)
+    needs_short = not summary_short and (summary_full or needs_full)
+    cached_prefix = None
+    if raw_transcript and (needs_format or needs_full or needs_short):
+        stripped = re.sub(r'^\d+\.\d+:\s*', '', raw_transcript, flags=re.MULTILINE)
+        cached_prefix = f"Title: {title}\nDescription: {description}\n\nTranscript:\n{stripped}"
+
+    # Fix formatted transcript if missing, or regenerate if --fix-formatting
+    if needs_format:
+        print(f"{'Regenerating' if transcript_formatted else 'Fixing'} formatted transcript for {video_id}")
+        transcript_formatted = wordwrap(generate_with_claude(
+            "Clean up this AI-generated transcript for readability. Correct AI transcription artifacts like misheard names (e.g., 'Dr. Brite' to 'Dr. Bright'), spelling errors (e.g., 'capiscum' to 'capsicum'), grammar, and punctuation. Group into logical paragraphs, break run-on sentences, remove fillers where they disrupt flow. Keep content faithful.",
+            cached_prefix=cached_prefix))
+
+    # Generate full summary (from cached transcript)
+    if needs_full and transcript_formatted:
+        print(f"{'Regenerating' if summary_full else 'Generating'} full summary for {video_id}")
+        summary_full = wordwrap(generate_with_claude(
+            "Create a detailed full summary of this video. Cover all major sections, arguments, and insights in a structured narrative. Make it nicely formatted with headings, paragraphs, and bullets where appropriate.",
+            cached_prefix=cached_prefix))
+
+    # Generate short summary (from cached transcript)
+    if needs_short and (summary_full or transcript_formatted):
+        print(f"{'Regenerating' if summary_short else 'Generating'} short summary for {video_id}")
+        summary_short = wordwrap(generate_with_claude(
+            "Create a concise one-paragraph summary of this video. Capture key points, main ideas, and conclusions.",
+            max_tokens=500, cached_prefix=cached_prefix))
+
+    # Update video row
+    conn.execute("""
+    INSERT OR REPLACE INTO videos 
+        (video_id, title, upload_date, duration, description, channel_id, language, raw_transcript, transcript_formatted, summary_short, summary_full, fetched_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (video_id, title, upload_date, duration, description, channel_id, language, raw_transcript, transcript_formatted, summary_short, summary_full, fetched_at))
+    conn.commit()
+
+conn = sqlite3.connect(db_file, timeout=30)
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("""
+CREATE TABLE IF NOT EXISTS videos (
+    video_id     TEXT PRIMARY KEY,
+    title        TEXT,
+    upload_date  TEXT,
+    duration     TEXT,
+    description  TEXT,
+    channel_id   TEXT,
+    language     TEXT,
+    raw_transcript TEXT,
+    transcript_formatted TEXT,
+    summary_short TEXT,
+    summary_full TEXT,
+    fetched_at   TEXT
+)
+""")
+# Migrate old channel_names schema (display_name column) to new (name_type/name)
+cursor = conn.cursor()
+cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='channel_names'")
+if cursor.fetchone():
+    cursor.execute("PRAGMA table_info(channel_names)")
+    old_cols = {row[1] for row in cursor.fetchall()}
+    if 'display_name' in old_cols:
+        conn.execute("CREATE TABLE channel_names_new (channel_id TEXT, name_type TEXT, name TEXT, timestamp TEXT, PRIMARY KEY (channel_id, name_type, timestamp))")
+        conn.execute("INSERT INTO channel_names_new SELECT channel_id, 'fullname', display_name, timestamp FROM channel_names WHERE display_name IS NOT NULL")
+        if 'handle' in old_cols:
+            conn.execute("INSERT OR IGNORE INTO channel_names_new (channel_id, name_type, name, timestamp) SELECT channel_id, 'handle', handle, timestamp FROM channel_names WHERE handle IS NOT NULL AND handle <> ''")
+        conn.execute("DROP TABLE channel_names")
+        conn.execute("ALTER TABLE channel_names_new RENAME TO channel_names")
+
+conn.execute("""
+CREATE TABLE IF NOT EXISTS channel_names (
+    channel_id   TEXT,
+    name_type    TEXT,
+    name         TEXT,
+    timestamp    TEXT,
+    PRIMARY KEY (channel_id, name_type, timestamp)
+)
+""")
+
+# Add missing columns if they don't exist
+columns = [
+    'title', 'upload_date', 'duration', 'description', 'channel_id', 'language',
+    'raw_transcript', 'transcript_formatted', 'summary_short', 'summary_full', 'fetched_at'
+]
+for col in columns:
+    try:
+        conn.execute(f"ALTER TABLE videos ADD COLUMN {col} TEXT")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+
+# Drop vestigial 'transcript' column from older schema
+try:
+    conn.execute("ALTER TABLE videos DROP COLUMN transcript")
+except sqlite3.OperationalError:
+    pass  # Column doesn't exist
+
+conn.commit()
+
+if args.fix:
+    cursor = conn.cursor()
+    cursor.execute("SELECT video_id FROM videos WHERE title = '' OR upload_date = '' OR duration = '' OR description = '' OR channel_id = '' OR language = '' OR raw_transcript = '' OR transcript_formatted = '' OR summary_short = '' OR summary_full = '' OR title IS NULL OR upload_date IS NULL OR duration IS NULL OR description IS NULL OR channel_id IS NULL OR language IS NULL OR raw_transcript IS NULL OR transcript_formatted IS NULL OR summary_short IS NULL OR summary_full IS NULL OR length(description) <= 200")
+    to_fix = [row[0] for row in cursor.fetchall() if row[0] not in skip_ids]
+    for vid in to_fix:
+        print(f"Fixing fields for {vid}")
+        process_video(vid, conn)
+
+    # Populate channel_names for any channel_ids missing entries
+    cursor.execute("""
+        SELECT v.channel_id, MIN(v.video_id) as sample_video
+        FROM videos v
+        LEFT JOIN channel_names cn ON v.channel_id = cn.channel_id
+        WHERE v.channel_id IS NOT NULL AND v.channel_id <> ''
+        AND cn.channel_id IS NULL
+        GROUP BY v.channel_id
+    """)
+    for ch_id, vid in cursor.fetchall():
+        print(f"Fetching channel name for {ch_id} via {vid}")
+        _, _, _, _, _, channel_name, channel_handle = fetch_youtube_metadata(vid)
+        ts = datetime.now().isoformat()
+        if channel_name:
+            conn.execute("INSERT INTO channel_names (channel_id, name_type, name, timestamp) VALUES (?, 'fullname', ?, ?)", (ch_id, channel_name, ts))
+        if channel_handle:
+            conn.execute("INSERT INTO channel_names (channel_id, name_type, name, timestamp) VALUES (?, 'handle', ?, ?)", (ch_id, channel_handle, ts))
+        conn.commit()
+
+    print("✓ Fix complete")
+
+if not args.fix:
+    video_id = extract_youtube_id(args.video_url_or_id)
+    cursor = conn.cursor()
+    cursor.execute("SELECT raw_transcript FROM videos WHERE video_id = ?", (video_id,))
+    result = cursor.fetchone()
+    if result and result[0]:
+        print(f"Transcript already downloaded for {video_id}. Skipping download.")
+    else:
+        process_video(video_id, conn)
+
+conn.close()
+print(f"✓ Database updated: {db_file}")
