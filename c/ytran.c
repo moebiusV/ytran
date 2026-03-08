@@ -298,6 +298,7 @@ static Metadata fetch_youtube_metadata(const char *video_id)
 	snprintf(url, sizeof(url), "https://www.youtube.com/watch?v=%s", video_id);
 	char *page = http_fetch(url, NULL, NULL, 30);
 	if (!page) return m;
+	sanitize_utf8(page);
 
 	/* Title */
 	m.title = find_between(page, "<title>", "</title>");
