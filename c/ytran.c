@@ -37,6 +37,7 @@ static const struct { const char *model; double pi, pcw, pcr, po; } pricing[] = 
 static double total_cost;
 static char *transcript_api_key;
 static char *anthropic_api_key;
+static const char *model = "claude-sonnet-4-5";
 
 /* ── Buffer ── */
 
@@ -57,6 +58,38 @@ static void buf_append(Buf *b, const char *s, size_t n)
 static void buf_free(Buf *b) { free(b->data); memset(b, 0, sizeof(*b)); }
 
 /* ── String helpers ── */
+
+/* Strip invalid UTF-8 sequences (surrogates, overlong, truncated) in place. */
+static void sanitize_utf8(char *s)
+{
+	unsigned char *r = (unsigned char *)s, *w = (unsigned char *)s;
+	while (*r) {
+		if (r[0] < 0x80) {
+			*w++ = *r++;
+		} else if ((r[0] & 0xE0) == 0xC0 && (r[1] & 0xC0) == 0x80) {
+			unsigned cp = ((r[0] & 0x1F) << 6) | (r[1] & 0x3F);
+			if (cp >= 0x80) { *w++ = *r++; *w++ = *r++; }
+			else r += 2; /* overlong */
+		} else if ((r[0] & 0xF0) == 0xE0 && (r[1] & 0xC0) == 0x80 &&
+		           (r[2] & 0xC0) == 0x80) {
+			unsigned cp = ((r[0] & 0x0F) << 12) | ((r[1] & 0x3F) << 6) |
+			              (r[2] & 0x3F);
+			if (cp >= 0x0800 && (cp < 0xD800 || cp > 0xDFFF)) {
+				*w++ = *r++; *w++ = *r++; *w++ = *r++;
+			} else r += 3; /* surrogate or overlong */
+		} else if ((r[0] & 0xF8) == 0xF0 && (r[1] & 0xC0) == 0x80 &&
+		           (r[2] & 0xC0) == 0x80 && (r[3] & 0xC0) == 0x80) {
+			unsigned cp = ((r[0] & 0x07) << 18) | ((r[1] & 0x3F) << 12) |
+			              ((r[2] & 0x3F) << 6) | (r[3] & 0x3F);
+			if (cp >= 0x10000 && cp <= 0x10FFFF) {
+				*w++ = *r++; *w++ = *r++; *w++ = *r++; *w++ = *r++;
+			} else r += 4;
+		} else {
+			r++; /* invalid lead byte, skip */
+		}
+	}
+	*w = '\0';
+}
 
 /* Return malloc'd string between two markers, or NULL. */
 static char *find_between(const char *hay, const char *before, const char *after)
@@ -169,7 +202,27 @@ static char *http_fetch(const char *url, const char *post_body,
 		return NULL;
 	}
 	if (code >= 400) {
-		fprintf(stderr, "HTTP %ld fetching %s\n", code, url);
+		fprintf(stderr, "HTTP %ld: ", code);
+		/* Try to extract JSON error message */
+		bool printed = false;
+		if (resp.data) {
+			cJSON *err = cJSON_Parse(resp.data);
+			if (err) {
+				cJSON *eo = cJSON_GetObjectItem(err, "error");
+				if (eo) {
+					cJSON *msg = cJSON_GetObjectItem(eo, "message");
+					if (cJSON_IsString(msg)) {
+						fprintf(stderr, "%s\n", msg->valuestring);
+						printed = true;
+					}
+				}
+				cJSON_Delete(err);
+			}
+			if (!printed)
+				fprintf(stderr, "%s\n", url);
+		} else {
+			fprintf(stderr, "%s\n", url);
+		}
 		buf_free(&resp);
 		return NULL;
 	}
@@ -451,6 +504,7 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 	struct curl_slist *headers = NULL;
 	headers = curl_slist_append(headers, auth_hdr);
 	headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
+	headers = curl_slist_append(headers, "anthropic-beta: prompt-caching-2024-07-31");
 	headers = curl_slist_append(headers, "content-type: application/json");
 
 	char *resp = http_fetch("https://api.anthropic.com/v1/messages",
@@ -633,16 +687,18 @@ static void process_video(const char *video_id, sqlite3 *db)
 	    EMPTY(description) || EMPTY(channel_id) || desc_truncated) {
 		printf("Fixing metadata for %s\n", video_id);
 		Metadata m = fetch_youtube_metadata(video_id);
-		fill(&title, m.title);
-		fill(&upload_date, m.upload_date);
-		fill(&duration, m.duration);
+		fill(&title, m.title); m.title = NULL;
+		fill(&upload_date, m.upload_date); m.upload_date = NULL;
+		fill(&duration, m.duration); m.duration = NULL;
 		if (EMPTY(description) || (desc_truncated && m.description &&
 		    strlen(m.description) > strlen(description))) {
 			free(description);
 			description = m.description;
-			m.description = NULL;
+		} else {
+			free(m.description);
 		}
-		fill(&channel_id, m.channel_id);
+		m.description = NULL;
+		fill(&channel_id, m.channel_id); m.channel_id = NULL;
 		channel_name = m.channel_name; m.channel_name = NULL;
 		channel_handle = m.channel_handle; m.channel_handle = NULL;
 		metadata_free(&m);
@@ -734,6 +790,8 @@ static void process_video(const char *video_id, sqlite3 *db)
 		if (asprintf(&cached_prefix, "Title: %s\nDescription: %s\n\nTranscript:\n%s",
 			title ? title : "", description ? description : "", stripped) < 0)
 			cached_prefix = NULL;
+		else
+			sanitize_utf8(cached_prefix);
 		free(stripped);
 	}
 
@@ -747,7 +805,7 @@ static void process_video(const char *video_id, sqlite3 *db)
 			"(e.g., 'capiscum' to 'capsicum'), grammar, and punctuation. "
 			"Group into logical paragraphs, break run-on sentences, "
 			"remove fillers where they disrupt flow. Keep content faithful.",
-			cached_prefix, "claude-opus-4-6", 16000);
+			cached_prefix, model, 16000);
 		free(transcript_formatted);
 		transcript_formatted = wordwrap(raw);
 		free(raw);
@@ -761,7 +819,7 @@ static void process_video(const char *video_id, sqlite3 *db)
 			"sections, arguments, and insights in a structured narrative. "
 			"Make it nicely formatted with headings, paragraphs, and bullets "
 			"where appropriate.",
-			cached_prefix, "claude-opus-4-6", 16000);
+			cached_prefix, model, 16000);
 		free(summary_full);
 		summary_full = wordwrap(raw);
 		free(raw);
@@ -773,7 +831,7 @@ static void process_video(const char *video_id, sqlite3 *db)
 		char *raw = generate_with_claude(
 			"Create a concise one-paragraph summary of this video. "
 			"Capture key points, main ideas, and conclusions.",
-			cached_prefix, "claude-opus-4-6", 500);
+			cached_prefix, model, 500);
 		free(summary_short);
 		summary_short = wordwrap(raw);
 		free(raw);
@@ -819,22 +877,25 @@ int main(int argc, char **argv)
 	static struct option longopts[] = {
 		{"browse", no_argument, NULL, 'b'},
 		{"fix",    no_argument, NULL, 'f'},
+		{"model",  required_argument, NULL, 'm'},
 		{"skip",   required_argument, NULL, 's'},
 		{"help",   no_argument, NULL, 'h'},
 		{NULL, 0, NULL, 0}
 	};
 
 	int opt;
-	while ((opt = getopt_long(argc, argv, "bfs:h", longopts, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "bfm:s:h", longopts, NULL)) != -1) {
 		switch (opt) {
 		case 'b': browse = true; break;
 		case 'f': fix = true; break;
+		case 'm': model = optarg; break;
 		case 's': skip_str = optarg; break;
 		case 'h':
 			printf("Usage: ytran [OPTIONS] [VIDEO_URL_OR_ID]\n"
-			       "  --browse    Browse the transcript database\n"
-			       "  --fix       Fill in missing fields\n"
-			       "  --skip IDs  Comma-separated video IDs to skip\n");
+			       "  --browse        Browse the transcript database\n"
+			       "  --fix           Fill in missing fields\n"
+			       "  --model MODEL   Claude model [%s]\n"
+			       "  --skip IDs      Comma-separated video IDs to skip\n", model);
 			return 0;
 		default: return 1;
 		}
