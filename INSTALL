@@ -23,9 +23,24 @@ To uninstall:
 
 API Keys:
 
-  ytran expects two API key files:
+  ytran expects two API key files.  Create these before running ytran.
 
-    ~/.youtubetotranscript_api_key   — transcriptapi.com bearer token
-    ~/.anthropic_api_key             — Anthropic API key
+  1. Anthropic API key (~/.anthropic_api_key)
 
-  Create these files before running ytran.
+     Sign up at console.anthropic.com, go to API Keys, and create a key.
+     Save it:
+
+       echo 'sk-ant-...' > ~/.anthropic_api_key
+       chmod 600 ~/.anthropic_api_key     # read/write for you only
+
+  2. Transcript API key (~/.youtubetotranscript_api_key)
+
+     Sign up at transcriptapi.com, copy your bearer token from the
+     dashboard.  Save it:
+
+       echo 'your-token-here' > ~/.youtubetotranscript_api_key
+       chmod 600 ~/.youtubetotranscript_api_key
+
+  The chmod 600 sets permissions to -rw-------, meaning only your user
+  can read or write the file.  Without this, other users on the system
+  could read your API keys.  Never use 644 or 755 for secret files.
