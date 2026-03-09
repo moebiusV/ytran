@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
@@ -57,6 +58,17 @@ static void buf_append(Buf *b, const char *s, size_t n)
 }
 
 static void buf_free(Buf *b) { free(b->data); memset(b, 0, sizeof(*b)); }
+
+__attribute__((format(printf, 2, 3)))
+static void buf_printf(Buf *b, const char *fmt, ...)
+{
+	char *s = NULL;
+	va_list ap;
+	va_start(ap, fmt);
+	int n = vasprintf(&s, fmt, ap);
+	va_end(ap);
+	if (n >= 0) { buf_append(b, s, n); free(s); }
+}
 
 /* ── String helpers ── */
 
@@ -165,6 +177,10 @@ static char *xdg_data_home(void)
 	return path;
 }
 
+/* ── Fix-mode state ── */
+static bool g_fix_mode = false;
+static long g_last_http_error = 0;  /* non-zero if last http_fetch failed */
+
 /* ── HTTP ── */
 
 static size_t curl_write_cb(void *ptr, size_t size, size_t nmemb, void *ud)
@@ -198,31 +214,38 @@ static char *http_fetch(const char *url, const char *post_body,
 	curl_easy_cleanup(c);
 
 	if (res != CURLE_OK) {
-		fprintf(stderr, "HTTP error: %s\n", curl_easy_strerror(res));
+		if (g_fix_mode)
+			g_last_http_error = -1;
+		else
+			fprintf(stderr, "HTTP error: %s\n", curl_easy_strerror(res));
 		buf_free(&resp);
 		return NULL;
 	}
 	if (code >= 400) {
-		fprintf(stderr, "HTTP %ld: ", code);
-		/* Try to extract JSON error message */
-		bool printed = false;
-		if (resp.data) {
-			cJSON *err = cJSON_Parse(resp.data);
-			if (err) {
-				cJSON *eo = cJSON_GetObjectItem(err, "error");
-				if (eo) {
-					cJSON *msg = cJSON_GetObjectItem(eo, "message");
-					if (cJSON_IsString(msg)) {
-						fprintf(stderr, "%s\n", msg->valuestring);
-						printed = true;
-					}
-				}
-				cJSON_Delete(err);
-			}
-			if (!printed)
-				fprintf(stderr, "%s\n", url);
+		if (g_fix_mode) {
+			g_last_http_error = code;
 		} else {
-			fprintf(stderr, "%s\n", url);
+			fprintf(stderr, "HTTP %ld: ", code);
+			/* Try to extract JSON error message */
+			bool printed = false;
+			if (resp.data) {
+				cJSON *err = cJSON_Parse(resp.data);
+				if (err) {
+					cJSON *eo = cJSON_GetObjectItem(err, "error");
+					if (eo) {
+						cJSON *msg = cJSON_GetObjectItem(eo, "message");
+						if (cJSON_IsString(msg)) {
+							fprintf(stderr, "%s\n", msg->valuestring);
+							printed = true;
+						}
+					}
+					cJSON_Delete(err);
+				}
+				if (!printed)
+					fprintf(stderr, "%s\n", url);
+			} else {
+				fprintf(stderr, "%s\n", url);
+			}
 		}
 		buf_free(&resp);
 		return NULL;
@@ -683,12 +706,28 @@ static void process_video(const char *video_id, sqlite3 *db)
 		strftime(fetched_at, 32, "%Y-%m-%dT%H:%M:%S", tm);
 	}
 
+	/* In fix mode, collect step results into one line */
+	Buf fix_line;
+	if (g_fix_mode) buf_init(&fix_line);
+	bool had_title = !EMPTY(title);
+
 	/* Fix metadata if missing */
 	bool desc_truncated = description && strlen(description) <= 200;
 	if (EMPTY(title) || EMPTY(upload_date) || EMPTY(duration) ||
 	    EMPTY(description) || EMPTY(channel_id) || desc_truncated) {
-		printf("Fixing metadata for %s\n", video_id);
+		if (!g_fix_mode)
+			printf("Fixing metadata for %s\n", video_id);
+		g_last_http_error = 0;
 		Metadata m = fetch_youtube_metadata(video_id);
+		if (g_fix_mode) {
+			/* Print title now if we just learned it */
+			if (!had_title && !EMPTY(m.title))
+				printf("%s", m.title);
+			if (g_last_http_error)
+				buf_printf(&fix_line, " metadata:%ld", g_last_http_error);
+			else
+				buf_printf(&fix_line, " metadata");
+		}
 		fill(&title, m.title); m.title = NULL;
 		fill(&upload_date, m.upload_date); m.upload_date = NULL;
 		fill(&duration, m.duration); m.duration = NULL;
@@ -717,8 +756,12 @@ static void process_video(const char *video_id, sqlite3 *db)
 			bool found = sqlite3_step(st) == SQLITE_ROW;
 			sqlite3_finalize(st);
 			if (!found) {
-				printf("Fetching channel name for %s\n", video_id);
+				if (!g_fix_mode)
+					printf("Fetching channel name for %s\n", video_id);
+				g_last_http_error = 0;
 				Metadata m = fetch_youtube_metadata(video_id);
+				if (g_fix_mode && g_last_http_error)
+					buf_printf(&fix_line, " channel:%ld", g_last_http_error);
 				channel_name = m.channel_name; m.channel_name = NULL;
 				channel_handle = m.channel_handle; m.channel_handle = NULL;
 				metadata_free(&m);
@@ -774,9 +817,17 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 	/* Fix raw transcript if missing */
 	if (EMPTY(raw_transcript)) {
-		printf("Fetching transcript for %s\n", video_id);
+		if (!g_fix_mode)
+			printf("Fetching transcript for %s\n", video_id);
+		g_last_http_error = 0;
 		char *lang = NULL;
 		char *rt = fetch_raw_transcript(video_id, &lang);
+		if (g_fix_mode) {
+			if (g_last_http_error)
+				buf_printf(&fix_line, " transcript:%ld", g_last_http_error);
+			else
+				buf_printf(&fix_line, " transcript");
+		}
 		if (rt) { free(raw_transcript); raw_transcript = rt; }
 		if (lang) { free(language); language = lang; }
 	}
@@ -799,7 +850,9 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 	/* Generate formatted transcript */
 	if (needs_format) {
-		printf("Formatting transcript for %s\n", video_id);
+		if (!g_fix_mode)
+			printf("Formatting transcript for %s\n", video_id);
+		g_last_http_error = 0;
 		char *raw = generate_with_claude(
 			"Clean up this AI-generated transcript for readability. "
 			"Correct AI transcription artifacts like misheard names "
@@ -808,6 +861,12 @@ static void process_video(const char *video_id, sqlite3 *db)
 			"Group into logical paragraphs, break run-on sentences, "
 			"remove fillers where they disrupt flow. Keep content faithful.",
 			cached_prefix, model, 16000);
+		if (g_fix_mode) {
+			if (g_last_http_error)
+				buf_printf(&fix_line, " format:%ld", g_last_http_error);
+			else
+				buf_printf(&fix_line, " format");
+		}
 		free(transcript_formatted);
 		transcript_formatted = wordwrap(raw);
 		free(raw);
@@ -815,13 +874,21 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 	/* Generate full summary */
 	if (needs_full && !EMPTY(transcript_formatted)) {
-		printf("Generating full summary for %s\n", video_id);
+		if (!g_fix_mode)
+			printf("Generating full summary for %s\n", video_id);
+		g_last_http_error = 0;
 		char *raw = generate_with_claude(
 			"Create a detailed full summary of this video. Cover all major "
 			"sections, arguments, and insights in a structured narrative. "
 			"Make it nicely formatted with headings, paragraphs, and bullets "
 			"where appropriate.",
 			cached_prefix, model, 16000);
+		if (g_fix_mode) {
+			if (g_last_http_error)
+				buf_printf(&fix_line, " summary_full:%ld", g_last_http_error);
+			else
+				buf_printf(&fix_line, " summary_full");
+		}
 		free(summary_full);
 		summary_full = wordwrap(raw);
 		free(raw);
@@ -829,17 +896,34 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 	/* Generate short summary */
 	if (needs_short && (!EMPTY(summary_full) || !EMPTY(transcript_formatted))) {
-		printf("Generating short summary for %s\n", video_id);
+		if (!g_fix_mode)
+			printf("Generating short summary for %s\n", video_id);
+		g_last_http_error = 0;
 		char *raw = generate_with_claude(
 			"Create a concise one-paragraph summary of this video. "
 			"Capture key points, main ideas, and conclusions.",
 			cached_prefix, model, 500);
+		if (g_fix_mode) {
+			if (g_last_http_error)
+				buf_printf(&fix_line, " summary_short:%ld", g_last_http_error);
+			else
+				buf_printf(&fix_line, " summary_short");
+		}
 		free(summary_short);
 		summary_short = wordwrap(raw);
 		free(raw);
 	}
 
 	free(cached_prefix);
+
+	/* In fix mode, print collected actions as one line */
+	if (g_fix_mode && fix_line.len > 0) {
+		printf(" %s\n", fix_line.data);
+		buf_free(&fix_line);
+	} else if (g_fix_mode) {
+		printf("\n");
+		buf_free(&fix_line);
+	}
 
 	/* Upsert */
 	sqlite3_prepare_v2(db,
@@ -973,10 +1057,11 @@ int main(int argc, char **argv)
 	}
 
 	if (fix) {
+		g_fix_mode = true;
 		/* Collect all IDs first to avoid modifying table while iterating */
 		sqlite3_stmt *st;
 		sqlite3_prepare_v2(db,
-			"SELECT video_id FROM videos WHERE "
+			"SELECT video_id, title FROM videos WHERE "
 			"title = '' OR upload_date = '' OR duration = '' OR description = '' OR "
 			"channel_id = '' OR language = '' OR raw_transcript = '' OR "
 			"transcript_formatted = '' OR summary_short = '' OR summary_full = '' OR "
@@ -985,7 +1070,8 @@ int main(int argc, char **argv)
 			"raw_transcript IS NULL OR transcript_formatted IS NULL OR "
 			"summary_short IS NULL OR summary_full IS NULL OR length(description) <= 200",
 			-1, &st, NULL);
-		char **fix_ids = NULL;
+		typedef struct { char *id; char *title; } FixEntry;
+		FixEntry *fix_entries = NULL;
 		int nfix = 0;
 		while (sqlite3_step(st) == SQLITE_ROW) {
 			const char *vid = (const char *)sqlite3_column_text(st, 0);
@@ -993,17 +1079,23 @@ int main(int argc, char **argv)
 			for (int i = 0; i < nskip; i++)
 				if (strcmp(vid, skip_ids[i]) == 0) { skip = true; break; }
 			if (!skip) {
-				fix_ids = realloc(fix_ids, (nfix + 1) * sizeof(char *));
-				fix_ids[nfix++] = strdup(vid);
+				fix_entries = realloc(fix_entries, (nfix + 1) * sizeof(FixEntry));
+				fix_entries[nfix].id = strdup(vid);
+				const char *t = (const char *)sqlite3_column_text(st, 1);
+				fix_entries[nfix].title = (t && *t) ? strdup(t) : NULL;
+				nfix++;
 			}
 		}
 		sqlite3_finalize(st);
 		for (int i = 0; i < nfix; i++) {
-			printf("Fixing fields for %s\n", fix_ids[i]);
-			process_video(fix_ids[i], db);
-			free(fix_ids[i]);
+			printf("%s %s", fix_entries[i].id,
+				fix_entries[i].title ? fix_entries[i].title : "");
+			fflush(stdout);
+			process_video(fix_entries[i].id, db);
+			free(fix_entries[i].id);
+			free(fix_entries[i].title);
 		}
-		free(fix_ids);
+		free(fix_entries);
 
 		/* Populate channel_names for channels missing entries */
 		typedef struct { char *ch_id; char *vid; } ChFix;
@@ -1023,8 +1115,12 @@ int main(int argc, char **argv)
 		}
 		sqlite3_finalize(st);
 		for (int i = 0; i < nch; i++) {
-			printf("Fetching channel name for %s via %s\n", ch_fixes[i].ch_id, ch_fixes[i].vid);
+			g_last_http_error = 0;
 			Metadata m = fetch_youtube_metadata(ch_fixes[i].vid);
+			if (g_last_http_error)
+				printf("channel %s via %s: %ld\n", ch_fixes[i].ch_id, ch_fixes[i].vid, g_last_http_error);
+			else
+				printf("channel %s via %s\n", ch_fixes[i].ch_id, ch_fixes[i].vid);
 			time_t now = time(NULL);
 			struct tm *tm = localtime(&now);
 			char ts[32];
