@@ -180,7 +180,7 @@ static char *xdg_data_home(void)
 
 /* ── Fix-mode state ── */
 static bool g_fix_mode = false;
-static long g_last_http_error = 0;  /* non-zero if last http_fetch failed */
+static char g_last_http_error[64];  /* empty if OK, else error description */
 
 /* ── HTTP ── */
 
@@ -216,7 +216,8 @@ static char *http_fetch(const char *url, const char *post_body,
 
 	if (res != CURLE_OK) {
 		if (g_fix_mode)
-			g_last_http_error = -1;
+			snprintf(g_last_http_error, sizeof(g_last_http_error),
+				"%s", curl_easy_strerror(res));
 		else
 			fprintf(stderr, "HTTP error: %s\n", curl_easy_strerror(res));
 		buf_free(&resp);
@@ -224,7 +225,8 @@ static char *http_fetch(const char *url, const char *post_body,
 	}
 	if (code >= 400) {
 		if (g_fix_mode) {
-			g_last_http_error = code;
+			snprintf(g_last_http_error, sizeof(g_last_http_error),
+				"HTTP %ld", code);
 		} else {
 			fprintf(stderr, "HTTP %ld: ", code);
 			/* Try to extract JSON error message */
@@ -716,14 +718,14 @@ static void process_video(const char *video_id, sqlite3 *db)
 	    EMPTY(description) || EMPTY(channel_id) || desc_truncated) {
 		if (!g_fix_mode)
 			printf("Fixing metadata for %s\n", video_id);
-		g_last_http_error = 0;
+		g_last_http_error[0] = '\0';
 		Metadata m = fetch_youtube_metadata(video_id);
 		if (g_fix_mode) {
 			/* Print title now if we just learned it */
 			if (!had_title && !EMPTY(m.title))
 				printf("%s", m.title);
-			if (g_last_http_error)
-				buf_printf(&fix_line, " metadata:%ld", g_last_http_error);
+			if (g_last_http_error[0])
+				buf_printf(&fix_line, " metadata:%s", g_last_http_error);
 			else
 				buf_printf(&fix_line, " metadata");
 		}
@@ -757,10 +759,10 @@ static void process_video(const char *video_id, sqlite3 *db)
 			if (!found) {
 				if (!g_fix_mode)
 					printf("Fetching channel name for %s\n", video_id);
-				g_last_http_error = 0;
+				g_last_http_error[0] = '\0';
 				Metadata m = fetch_youtube_metadata(video_id);
-				if (g_fix_mode && g_last_http_error)
-					buf_printf(&fix_line, " channel:%ld", g_last_http_error);
+				if (g_fix_mode && g_last_http_error[0])
+					buf_printf(&fix_line, " channel:%s", g_last_http_error);
 				channel_name = m.channel_name; m.channel_name = NULL;
 				channel_handle = m.channel_handle; m.channel_handle = NULL;
 				metadata_free(&m);
@@ -818,12 +820,12 @@ static void process_video(const char *video_id, sqlite3 *db)
 	if (EMPTY(raw_transcript)) {
 		if (!g_fix_mode)
 			printf("Fetching transcript for %s\n", video_id);
-		g_last_http_error = 0;
+		g_last_http_error[0] = '\0';
 		char *lang = NULL;
 		char *rt = fetch_raw_transcript(video_id, &lang);
 		if (g_fix_mode) {
-			if (g_last_http_error)
-				buf_printf(&fix_line, " transcript:%ld", g_last_http_error);
+			if (g_last_http_error[0])
+				buf_printf(&fix_line, " transcript:%s", g_last_http_error);
 			else
 				buf_printf(&fix_line, " transcript");
 		}
@@ -853,7 +855,7 @@ static void process_video(const char *video_id, sqlite3 *db)
 			printf("Formatting transcript for %s", video_id);
 			fflush(stdout);
 		}
-		g_last_http_error = 0;
+		g_last_http_error[0] = '\0';
 		g_last_cost = 0;
 		char *raw = generate_with_claude(
 			"Clean up this AI-generated transcript for readability. "
@@ -864,8 +866,8 @@ static void process_video(const char *video_id, sqlite3 *db)
 			"remove fillers where they disrupt flow. Keep content faithful.",
 			cached_prefix, model, 16000);
 		if (g_fix_mode) {
-			if (g_last_http_error)
-				buf_printf(&fix_line, " format:%ld", g_last_http_error);
+			if (g_last_http_error[0])
+				buf_printf(&fix_line, " format:%s", g_last_http_error);
 			else
 				buf_printf(&fix_line, " format:$%.4f", g_last_cost);
 		} else {
@@ -882,7 +884,7 @@ static void process_video(const char *video_id, sqlite3 *db)
 			printf("Generating full summary for %s", video_id);
 			fflush(stdout);
 		}
-		g_last_http_error = 0;
+		g_last_http_error[0] = '\0';
 		g_last_cost = 0;
 		char *raw = generate_with_claude(
 			"Create a detailed full summary of this video. Cover all major "
@@ -891,8 +893,8 @@ static void process_video(const char *video_id, sqlite3 *db)
 			"where appropriate.",
 			cached_prefix, model, 16000);
 		if (g_fix_mode) {
-			if (g_last_http_error)
-				buf_printf(&fix_line, " summary_full:%ld", g_last_http_error);
+			if (g_last_http_error[0])
+				buf_printf(&fix_line, " summary_full:%s", g_last_http_error);
 			else
 				buf_printf(&fix_line, " summary_full:$%.4f", g_last_cost);
 		} else {
@@ -909,15 +911,15 @@ static void process_video(const char *video_id, sqlite3 *db)
 			printf("Generating short summary for %s", video_id);
 			fflush(stdout);
 		}
-		g_last_http_error = 0;
+		g_last_http_error[0] = '\0';
 		g_last_cost = 0;
 		char *raw = generate_with_claude(
 			"Create a concise one-paragraph summary of this video. "
 			"Capture key points, main ideas, and conclusions.",
 			cached_prefix, model, 500);
 		if (g_fix_mode) {
-			if (g_last_http_error)
-				buf_printf(&fix_line, " summary_short:%ld", g_last_http_error);
+			if (g_last_http_error[0])
+				buf_printf(&fix_line, " summary_short:%s", g_last_http_error);
 			else
 				buf_printf(&fix_line, " summary_short:$%.4f", g_last_cost);
 		} else {
@@ -1129,10 +1131,10 @@ int main(int argc, char **argv)
 		}
 		sqlite3_finalize(st);
 		for (int i = 0; i < nch; i++) {
-			g_last_http_error = 0;
+			g_last_http_error[0] = '\0';
 			Metadata m = fetch_youtube_metadata(ch_fixes[i].vid);
-			if (g_last_http_error)
-				printf("channel %s via %s: %ld\n", ch_fixes[i].ch_id, ch_fixes[i].vid, g_last_http_error);
+			if (g_last_http_error[0])
+				printf("channel %s via %s: %s\n", ch_fixes[i].ch_id, ch_fixes[i].vid, g_last_http_error);
 			else
 				printf("channel %s via %s\n", ch_fixes[i].ch_id, ch_fixes[i].vid);
 			time_t now = time(NULL);
