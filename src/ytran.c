@@ -579,12 +579,7 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 		double cost = (in_tok * pi + cw_tok * pcw + cr_tok * pcr + out_tok * po) / 1e6;
 		total_cost += cost;
 		g_last_cost = cost;
-		if (!g_fix_mode) {
-			fprintf(stderr, "  API: %d in + %d out", in_tok, out_tok);
-			if (cw_tok) fprintf(stderr, ", %d cache_write", cw_tok);
-			if (cr_tok) fprintf(stderr, ", %d cache_read", cr_tok);
-			fprintf(stderr, " = $%.4f (total: $%.4f)\n", cost, total_cost);
-		}
+		/* Cost is printed inline by the caller */
 	}
 
 	cJSON_Delete(root);
