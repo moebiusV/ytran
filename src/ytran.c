@@ -37,6 +37,7 @@ static const struct { const char *model; double pi, pcw, pcr, po; } pricing[] = 
 /* ── Globals ── */
 
 static double total_cost;
+static double g_last_cost;  /* cost of most recent API call */
 static char *transcript_api_key;
 static char *anthropic_api_key;
 static const char *model = "claude-sonnet-4-5";
@@ -577,10 +578,13 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 			}
 		double cost = (in_tok * pi + cw_tok * pcw + cr_tok * pcr + out_tok * po) / 1e6;
 		total_cost += cost;
-		fprintf(stderr, "  API: %d in + %d out", in_tok, out_tok);
-		if (cw_tok) fprintf(stderr, ", %d cache_write", cw_tok);
-		if (cr_tok) fprintf(stderr, ", %d cache_read", cr_tok);
-		fprintf(stderr, " = $%.4f (total: $%.4f)\n", cost, total_cost);
+		g_last_cost = cost;
+		if (!g_fix_mode) {
+			fprintf(stderr, "  API: %d in + %d out", in_tok, out_tok);
+			if (cw_tok) fprintf(stderr, ", %d cache_write", cw_tok);
+			if (cr_tok) fprintf(stderr, ", %d cache_read", cr_tok);
+			fprintf(stderr, " = $%.4f (total: $%.4f)\n", cost, total_cost);
+		}
 	}
 
 	cJSON_Delete(root);
@@ -850,9 +854,12 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 	/* Generate formatted transcript */
 	if (needs_format) {
-		if (!g_fix_mode)
-			printf("Formatting transcript for %s\n", video_id);
+		if (!g_fix_mode) {
+			printf("Formatting transcript for %s", video_id);
+			fflush(stdout);
+		}
 		g_last_http_error = 0;
+		g_last_cost = 0;
 		char *raw = generate_with_claude(
 			"Clean up this AI-generated transcript for readability. "
 			"Correct AI transcription artifacts like misheard names "
@@ -865,7 +872,9 @@ static void process_video(const char *video_id, sqlite3 *db)
 			if (g_last_http_error)
 				buf_printf(&fix_line, " format:%ld", g_last_http_error);
 			else
-				buf_printf(&fix_line, " format");
+				buf_printf(&fix_line, " format:$%.4f", g_last_cost);
+		} else {
+			printf(" $%.4f\n", g_last_cost);
 		}
 		free(transcript_formatted);
 		transcript_formatted = wordwrap(raw);
@@ -874,9 +883,12 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 	/* Generate full summary */
 	if (needs_full && !EMPTY(transcript_formatted)) {
-		if (!g_fix_mode)
-			printf("Generating full summary for %s\n", video_id);
+		if (!g_fix_mode) {
+			printf("Generating full summary for %s", video_id);
+			fflush(stdout);
+		}
 		g_last_http_error = 0;
+		g_last_cost = 0;
 		char *raw = generate_with_claude(
 			"Create a detailed full summary of this video. Cover all major "
 			"sections, arguments, and insights in a structured narrative. "
@@ -887,7 +899,9 @@ static void process_video(const char *video_id, sqlite3 *db)
 			if (g_last_http_error)
 				buf_printf(&fix_line, " summary_full:%ld", g_last_http_error);
 			else
-				buf_printf(&fix_line, " summary_full");
+				buf_printf(&fix_line, " summary_full:$%.4f", g_last_cost);
+		} else {
+			printf(" $%.4f\n", g_last_cost);
 		}
 		free(summary_full);
 		summary_full = wordwrap(raw);
@@ -896,9 +910,12 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 	/* Generate short summary */
 	if (needs_short && (!EMPTY(summary_full) || !EMPTY(transcript_formatted))) {
-		if (!g_fix_mode)
-			printf("Generating short summary for %s\n", video_id);
+		if (!g_fix_mode) {
+			printf("Generating short summary for %s", video_id);
+			fflush(stdout);
+		}
 		g_last_http_error = 0;
+		g_last_cost = 0;
 		char *raw = generate_with_claude(
 			"Create a concise one-paragraph summary of this video. "
 			"Capture key points, main ideas, and conclusions.",
@@ -907,7 +924,9 @@ static void process_video(const char *video_id, sqlite3 *db)
 			if (g_last_http_error)
 				buf_printf(&fix_line, " summary_short:%ld", g_last_http_error);
 			else
-				buf_printf(&fix_line, " summary_short");
+				buf_printf(&fix_line, " summary_short:$%.4f", g_last_cost);
+		} else {
+			printf(" $%.4f\n", g_last_cost);
 		}
 		free(summary_short);
 		summary_short = wordwrap(raw);
@@ -981,7 +1000,7 @@ int main(int argc, char **argv)
 			printf("ytran 1.0\n");
 			return 0;
 		case 'h':
-			printf("Usage: ytran [OPTIONS] [VIDEO_URL_OR_ID]\n"
+			printf("Usage: ytran [OPTIONS] [VIDEO_URL_OR_ID ...]\n"
 			       "  --browse        Browse the transcript database\n"
 			       "  --fix           Fill in missing fields\n"
 			       "  --model MODEL   Claude model [%s]\n"
@@ -1008,9 +1027,9 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	const char *video_arg = (optind < argc) ? argv[optind] : NULL;
-	if (!fix && !video_arg) {
-		fprintf(stderr, "Usage: ytran [--browse|--fix] [VIDEO_URL_OR_ID]\n");
+	int nvids = argc - optind;
+	if (!fix && nvids < 1) {
+		fprintf(stderr, "Usage: ytran [--browse|--fix] [VIDEO_URL_OR_ID ...]\n");
 		return 1;
 	}
 
@@ -1155,32 +1174,36 @@ int main(int argc, char **argv)
 		printf("Fix complete\n");
 	}
 
-	if (!fix && video_arg) {
-		char *video_id = extract_youtube_id(video_arg);
-		if (!video_id) return 1;
+	if (!fix && nvids > 0) {
+		for (int vi = optind; vi < argc; vi++) {
+			char *video_id = extract_youtube_id(argv[vi]);
+			if (!video_id) continue;
 
-		/* Check if already exists */
-		sqlite3_stmt *st;
-		sqlite3_prepare_v2(db,
-			"SELECT raw_transcript FROM videos WHERE video_id = ?", -1, &st, NULL);
-		sqlite3_bind_text(st, 1, video_id, -1, SQLITE_STATIC);
-		bool exists = false;
-		if (sqlite3_step(st) == SQLITE_ROW) {
-			const char *rt = (const char *)sqlite3_column_text(st, 0);
-			if (rt && *rt) exists = true;
-		}
-		sqlite3_finalize(st);
+			/* Check if already exists */
+			sqlite3_stmt *st;
+			sqlite3_prepare_v2(db,
+				"SELECT raw_transcript FROM videos WHERE video_id = ?", -1, &st, NULL);
+			sqlite3_bind_text(st, 1, video_id, -1, SQLITE_STATIC);
+			bool exists = false;
+			if (sqlite3_step(st) == SQLITE_ROW) {
+				const char *rt = (const char *)sqlite3_column_text(st, 0);
+				if (rt && *rt) exists = true;
+			}
+			sqlite3_finalize(st);
 
-		if (exists) {
-			printf("Transcript already downloaded for %s. Skipping.\n", video_id);
-		} else {
-			process_video(video_id, db);
+			if (exists) {
+				printf("Transcript already downloaded for %s. Skipping.\n", video_id);
+			} else {
+				process_video(video_id, db);
+			}
+			free(video_id);
 		}
-		free(video_id);
 	}
 
 	sqlite3_close(db);
 	curl_global_cleanup();
+	if (total_cost > 0)
+		printf("Total API cost: $%.4f\n", total_cost);
 	printf("Database updated: %s\n", db_file);
 	free(db_dir);
 	free(db_file);
