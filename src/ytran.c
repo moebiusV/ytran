@@ -950,143 +950,47 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 	/* Build cached prefix for Claude calls */
 	char *cached_prefix = NULL;
-	char *stripped = NULL;
 	bool needs_format = EMPTY(transcript_formatted) && !EMPTY(raw_transcript);
 	bool needs_full = EMPTY(summary_full) && (!EMPTY(transcript_formatted) || needs_format);
 	bool needs_short = EMPTY(summary_short) && (!EMPTY(summary_full) || needs_full);
 
 	if (!EMPTY(raw_transcript) && (needs_format || needs_full || needs_short)) {
-		stripped = strip_timestamps(raw_transcript);
-		sanitize_utf8(stripped);
+		char *stripped = strip_timestamps(raw_transcript);
 		if (asprintf(&cached_prefix, "Title: %s\nDescription: %s\n\nTranscript:\n%s",
 			title ? title : "", description ? description : "", stripped) < 0)
 			cached_prefix = NULL;
 		else
 			sanitize_utf8(cached_prefix);
+		free(stripped);
 	}
 
-	/* Generate formatted transcript — chunk long transcripts */
-	#define FORMAT_CHUNK_SIZE  30000
-	#define FORMAT_OVERLAP       500
+	/* Generate formatted transcript */
 	if (needs_format) {
-		static const char *format_prompt =
+		if (!g_fix_mode) {
+			printf("Formatting transcript for %s", video_id);
+			fflush(stdout);
+		}
+		g_last_http_error[0] = '\0';
+		g_last_cost = 0;
+		char *raw = generate_with_claude(
 			"Clean up this AI-generated transcript for readability. "
 			"Correct AI transcription artifacts like misheard names "
 			"(e.g., 'Dr. Brite' to 'Dr. Bright'), spelling errors "
 			"(e.g., 'capiscum' to 'capsicum'), grammar, and punctuation. "
 			"Group into logical paragraphs, break run-on sentences, "
-			"remove fillers where they disrupt flow. Keep content faithful.";
-		static const char *format_prompt_chunk =
-			"Clean up this CHUNK of an AI-generated transcript for readability. "
-			"This is one part of a longer transcript — do not add introductions "
-			"or conclusions; just clean up the text as-is. "
-			"Correct AI transcription artifacts like misheard names "
-			"(e.g., 'Dr. Brite' to 'Dr. Bright'), spelling errors "
-			"(e.g., 'capiscum' to 'capsicum'), grammar, and punctuation. "
-			"Group into logical paragraphs, break run-on sentences, "
-			"remove fillers where they disrupt flow. Keep content faithful.";
-
-		size_t slen = stripped ? strlen(stripped) : 0;
-		if (slen <= FORMAT_CHUNK_SIZE) {
-			/* Short enough for a single call */
-			if (!g_fix_mode) {
-				printf("Formatting transcript for %s", video_id);
-				fflush(stdout);
-			}
-			g_last_http_error[0] = '\0';
-			g_last_cost = 0;
-			char *raw = generate_with_claude(format_prompt,
-				cached_prefix, model, 16000);
-			if (g_fix_mode) {
-				if (g_last_http_error[0])
-					buf_printf(&fix_line, " format:%s", g_last_http_error);
-				else
-					buf_printf(&fix_line, " format:$%.4f", g_last_cost);
-			} else {
-				printf(" $%.4f\n", g_last_cost);
-			}
-			free(transcript_formatted);
-			transcript_formatted = wordwrap(raw);
-			free(raw);
+			"remove fillers where they disrupt flow. Keep content faithful.",
+			cached_prefix, model, 16000);
+		if (g_fix_mode) {
+			if (g_last_http_error[0])
+				buf_printf(&fix_line, " format:%s", g_last_http_error);
+			else
+				buf_printf(&fix_line, " format:$%.4f", g_last_cost);
 		} else {
-			/* Chunk the transcript */
-			Buf formatted;
-			buf_init(&formatted);
-			double chunk_cost_total = 0;
-			bool chunk_error = false;
-			size_t offset = 0;
-			int chunk_num = 0;
-			int nchunks = (int)((slen + FORMAT_CHUNK_SIZE - 1) / FORMAT_CHUNK_SIZE);
-
-			while (offset < slen) {
-				chunk_num++;
-				size_t end = offset + FORMAT_CHUNK_SIZE;
-				if (end >= slen) {
-					end = slen;
-				} else {
-					/* Break at a newline to avoid splitting mid-sentence */
-					size_t nl = end;
-					while (nl > offset + FORMAT_CHUNK_SIZE / 2 && stripped[nl] != '\n')
-						nl--;
-					if (stripped[nl] == '\n') end = nl + 1;
-				}
-
-				char *chunk = strndup(stripped + offset, end - offset);
-				char *chunk_prefix;
-				if (asprintf(&chunk_prefix,
-					"Title: %s\nDescription: %s\n\n"
-					"Transcript (chunk %d of %d):\n%s",
-					title ? title : "", description ? description : "",
-					chunk_num, nchunks, chunk) < 0)
-					chunk_prefix = NULL;
-				else
-					sanitize_utf8(chunk_prefix);
-
-				if (!g_fix_mode) {
-					printf("Formatting transcript chunk %d/%d for %s",
-						chunk_num, nchunks, video_id);
-					fflush(stdout);
-				}
-				g_last_http_error[0] = '\0';
-				g_last_cost = 0;
-				char *raw = generate_with_claude(format_prompt_chunk,
-					chunk_prefix, model, 16000);
-				if (g_last_http_error[0]) {
-					chunk_error = true;
-				} else {
-					chunk_cost_total += g_last_cost;
-				}
-				if (!g_fix_mode) {
-					if (g_last_http_error[0])
-						printf(" %s\n", g_last_http_error);
-					else
-						printf(" $%.4f\n", g_last_cost);
-				}
-
-				if (raw && *raw) {
-					if (formatted.len > 0)
-						buf_append(&formatted, "\n\n", 2);
-					buf_append(&formatted, raw, strlen(raw));
-				}
-				free(raw);
-				free(chunk);
-				free(chunk_prefix);
-
-				if (end >= slen) break;
-				offset = end > FORMAT_OVERLAP ? end - FORMAT_OVERLAP : 0;
-			}
-
-			if (g_fix_mode) {
-				if (chunk_error)
-					buf_printf(&fix_line, " format(%d chunks):error", nchunks);
-				else
-					buf_printf(&fix_line, " format(%d chunks):$%.4f",
-						nchunks, chunk_cost_total);
-			}
-			free(transcript_formatted);
-			transcript_formatted = formatted.data ? wordwrap(formatted.data) : NULL;
-			buf_free(&formatted);
+			printf(" $%.4f\n", g_last_cost);
 		}
+		free(transcript_formatted);
+		transcript_formatted = wordwrap(raw);
+		free(raw);
 	}
 
 	/* Generate full summary */
@@ -1142,7 +1046,6 @@ static void process_video(const char *video_id, sqlite3 *db)
 	}
 
 	free(cached_prefix);
-	free(stripped);
 
 	/* In fix mode, print collected actions as one line */
 	if (g_fix_mode && fix_line.len > 0) {
