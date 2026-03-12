@@ -498,6 +498,105 @@ static char *wordwrap(const char *text)
 
 /* ── Claude API ── */
 
+/* ── Streaming SSE state ── */
+
+typedef struct {
+	Buf text;         /* accumulated response text */
+	Buf linebuf;      /* partial SSE line buffer */
+	int in_tok, out_tok, cw_tok, cr_tok;
+	bool error;
+	char errmsg[256];
+} StreamCtx;
+
+static void stream_init(StreamCtx *s)
+{
+	memset(s, 0, sizeof(*s));
+	buf_init(&s->text);
+	buf_init(&s->linebuf);
+}
+
+static void stream_free(StreamCtx *s)
+{
+	buf_free(&s->text);
+	buf_free(&s->linebuf);
+}
+
+/* Process a single SSE "data: {...}" line */
+static void stream_process_event(StreamCtx *s, const char *json_str)
+{
+	cJSON *ev = cJSON_Parse(json_str);
+	if (!ev) return;
+
+	const char *type = NULL;
+	cJSON *t = cJSON_GetObjectItem(ev, "type");
+	if (cJSON_IsString(t)) type = t->valuestring;
+
+	if (type && strcmp(type, "content_block_delta") == 0) {
+		cJSON *delta = cJSON_GetObjectItem(ev, "delta");
+		if (delta) {
+			cJSON *txt = cJSON_GetObjectItem(delta, "text");
+			if (cJSON_IsString(txt))
+				buf_append(&s->text, txt->valuestring, strlen(txt->valuestring));
+		}
+	} else if (type && strcmp(type, "message_start") == 0) {
+		/* Input token counts come in message_start.message.usage */
+		cJSON *message = cJSON_GetObjectItem(ev, "message");
+		cJSON *usage = message ? cJSON_GetObjectItem(message, "usage") : NULL;
+		if (usage) {
+			cJSON *v;
+			if ((v = cJSON_GetObjectItem(usage, "input_tokens")))
+				s->in_tok = v->valueint;
+			if ((v = cJSON_GetObjectItem(usage, "cache_creation_input_tokens")))
+				s->cw_tok = v->valueint;
+			if ((v = cJSON_GetObjectItem(usage, "cache_read_input_tokens")))
+				s->cr_tok = v->valueint;
+		}
+	} else if (type && strcmp(type, "message_delta") == 0) {
+		/* Output token count comes in message_delta.usage */
+		cJSON *usage = cJSON_GetObjectItem(ev, "usage");
+		if (usage) {
+			cJSON *v;
+			if ((v = cJSON_GetObjectItem(usage, "output_tokens")))
+				s->out_tok = v->valueint;
+		}
+	} else if (type && strcmp(type, "error") == 0) {
+		s->error = true;
+		cJSON *err = cJSON_GetObjectItem(ev, "error");
+		if (err) {
+			cJSON *msg = cJSON_GetObjectItem(err, "message");
+			if (cJSON_IsString(msg))
+				snprintf(s->errmsg, sizeof(s->errmsg), "%s", msg->valuestring);
+		}
+	}
+
+	cJSON_Delete(ev);
+}
+
+/* curl write callback for SSE: buffer lines, dispatch complete ones */
+static size_t stream_write_cb(void *ptr, size_t size, size_t nmemb, void *ud)
+{
+	StreamCtx *s = ud;
+	size_t total = size * nmemb;
+	const char *data = ptr;
+
+	for (size_t i = 0; i < total; i++) {
+		if (data[i] == '\n') {
+			/* Complete line — check if it's a data event */
+			if (s->linebuf.data && s->linebuf.len > 6 &&
+			    strncmp(s->linebuf.data, "data: ", 6) == 0) {
+				char *json = s->linebuf.data + 6;
+				if (strcmp(json, "[DONE]") != 0)
+					stream_process_event(s, json);
+			}
+			s->linebuf.len = 0;
+			if (s->linebuf.data) s->linebuf.data[0] = '\0';
+		} else {
+			buf_append(&s->linebuf, data + i, 1);
+		}
+	}
+	return total;
+}
+
 static char *generate_with_claude(const char *prompt, const char *cached_prefix,
                                   const char *model, int max_tokens)
 {
@@ -505,6 +604,7 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 	cJSON *req = cJSON_CreateObject();
 	cJSON_AddStringToObject(req, "model", model);
 	cJSON_AddNumberToObject(req, "max_tokens", max_tokens);
+	cJSON_AddBoolToObject(req, "stream", 1);
 
 	if (cached_prefix) {
 		cJSON *sys = cJSON_AddArrayToObject(req, "system");
@@ -535,56 +635,71 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 	headers = curl_slist_append(headers, "anthropic-beta: prompt-caching-2024-07-31");
 	headers = curl_slist_append(headers, "content-type: application/json");
 
-	char *resp = http_fetch("https://api.anthropic.com/v1/messages",
-		body, headers, 300);
+	/* Streaming request — use low-speed timeout instead of absolute timeout */
+	StreamCtx ctx;
+	stream_init(&ctx);
+
+	CURL *c = curl_easy_init();
+	curl_easy_setopt(c, CURLOPT_URL, "https://api.anthropic.com/v1/messages");
+	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, stream_write_cb);
+	curl_easy_setopt(c, CURLOPT_WRITEDATA, &ctx);
+	curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(c, CURLOPT_POSTFIELDS, body);
+	curl_easy_setopt(c, CURLOPT_USERAGENT,
+		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+	/* Time out if fewer than 100 bytes/sec for 60 seconds (i.e., stalled) */
+	curl_easy_setopt(c, CURLOPT_LOW_SPEED_LIMIT, 100L);
+	curl_easy_setopt(c, CURLOPT_LOW_SPEED_TIME, 60L);
+
+	CURLcode res = curl_easy_perform(c);
+	long code = 0;
+	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
+	curl_easy_cleanup(c);
 	free(body);
 	curl_slist_free_all(headers);
-	if (!resp) return strdup("");
 
-	/* Parse response */
-	cJSON *root = cJSON_Parse(resp);
-	free(resp);
-	if (!root) { fprintf(stderr, "Error parsing Claude response\n"); return strdup(""); }
-
-	char *result = strdup("");
-	cJSON *content = cJSON_GetObjectItem(root, "content");
-	if (cJSON_IsArray(content)) {
-		cJSON *first = cJSON_GetArrayItem(content, 0);
-		cJSON *text = first ? cJSON_GetObjectItem(first, "text") : NULL;
-		if (cJSON_IsString(text)) {
-			free(result);
-			result = strdup(text->valuestring);
-		}
+	if (res != CURLE_OK) {
+		if (g_fix_mode)
+			snprintf(g_last_http_error, sizeof(g_last_http_error),
+				"%s", curl_easy_strerror(res));
+		else
+			fprintf(stderr, "HTTP error: %s\n", curl_easy_strerror(res));
+		stream_free(&ctx);
+		return strdup("");
 	}
+	if (code >= 400) {
+		if (g_fix_mode) {
+			snprintf(g_last_http_error, sizeof(g_last_http_error),
+				"HTTP %ld", code);
+		} else {
+			fprintf(stderr, "HTTP %ld", code);
+			if (ctx.errmsg[0])
+				fprintf(stderr, ": %s\n", ctx.errmsg);
+			else
+				fprintf(stderr, "\n");
+		}
+		stream_free(&ctx);
+		return strdup("");
+	}
+
+	if (ctx.error && !g_fix_mode)
+		fprintf(stderr, "Stream error: %s\n", ctx.errmsg);
 
 	/* Cost tracking */
-	cJSON *usage = cJSON_GetObjectItem(root, "usage");
-	if (usage) {
-		int in_tok = 0, out_tok = 0, cw_tok = 0, cr_tok = 0;
-		cJSON *v;
-		if ((v = cJSON_GetObjectItem(usage, "input_tokens")))
-			in_tok = v->valueint;
-		if ((v = cJSON_GetObjectItem(usage, "output_tokens")))
-			out_tok = v->valueint;
-		if ((v = cJSON_GetObjectItem(usage, "cache_creation_input_tokens")))
-			cw_tok = v->valueint;
-		if ((v = cJSON_GetObjectItem(usage, "cache_read_input_tokens")))
-			cr_tok = v->valueint;
+	double pi = 5.0, pcw = 6.25, pcr = 0.50, po = 25.0;
+	for (int i = 0; pricing[i].model; i++)
+		if (strcmp(pricing[i].model, model) == 0) {
+			pi = pricing[i].pi; pcw = pricing[i].pcw;
+			pcr = pricing[i].pcr; po = pricing[i].po;
+			break;
+		}
+	double cost = (ctx.in_tok * pi + ctx.cw_tok * pcw +
+	               ctx.cr_tok * pcr + ctx.out_tok * po) / 1e6;
+	total_cost += cost;
+	g_last_cost = cost;
 
-		double pi = 5.0, pcw = 6.25, pcr = 0.50, po = 25.0;
-		for (int i = 0; pricing[i].model; i++)
-			if (strcmp(pricing[i].model, model) == 0) {
-				pi = pricing[i].pi; pcw = pricing[i].pcw;
-				pcr = pricing[i].pcr; po = pricing[i].po;
-				break;
-			}
-		double cost = (in_tok * pi + cw_tok * pcw + cr_tok * pcr + out_tok * po) / 1e6;
-		total_cost += cost;
-		g_last_cost = cost;
-		/* Cost is printed inline by the caller */
-	}
-
-	cJSON_Delete(root);
+	char *result = ctx.text.data ? strdup(ctx.text.data) : strdup("");
+	stream_free(&ctx);
 	return result;
 }
 
