@@ -24,11 +24,14 @@ See [INSTALL](INSTALL) for details, including API key setup.
 ## Usage
 
 ```
-ytran <youtube-url-or-id>    # Fetch and summarize a video
-ytran --browse               # Browse the transcript database
+ytran                        # Browse the transcript database (default)
+ytran <url-or-id> [...]      # Fetch and summarize one or more videos
+ytran -b/--browse [url ...]  # Browse the transcript database
 ytran --fix                  # Fill in missing fields in existing entries
-ytran --skip ID1,ID2         # Skip specific video IDs during --fix
+ytran --skip ID1,ID2 --fix   # Skip specific video IDs during --fix
 ```
+
+Options and URLs may be intermixed in any order.
 
 ## Database
 

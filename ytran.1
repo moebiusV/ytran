@@ -10,13 +10,15 @@ ytran \- fetch and summarize YouTube video transcripts
 fetches YouTube video transcripts via transcriptapi.com, formats them
 with Claude, generates summaries, and stores everything in a local
 SQLite database.
-.PP
-When invoked with no arguments, it opens an interactive browser for the
-transcript database.
 .SH OPTIONS
 .TP
+.BR \-b ", " \-\-browse
+Open an interactive browser for the transcript database after processing
+any URLs given on the command line.
+If invoked with no arguments,
 .B \-\-browse
-Open an interactive browser for the transcript database.
+is implied.
+Options and URLs may be intermixed in any order.
 .TP
 .B \-\-fix
 Scan all database entries and fill in any missing fields (metadata,

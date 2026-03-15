@@ -12,7 +12,6 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <getopt.h>
 #include <curl/curl.h>
 #include <sqlite3.h>
 #include <cjson/cJSON.h>
@@ -1086,32 +1085,45 @@ static void process_video(const char *video_id, sqlite3 *db)
 
 /* ── main ── */
 
+static bool is_arg(const char *a, const char *opt)
+{
+	size_t n = strlen(opt);
+	return strncmp(a, opt, n) == 0 && a[n] == '\0';
+}
+
+static const char *is_arg_val(const char *a, const char *opt)
+{
+	size_t n = strlen(opt);
+	if (strncmp(a, opt, n) == 0 && a[n] == '=')
+		return a + n + 1;
+	return NULL;
+}
+
 int main(int argc, char **argv)
 {
 	bool browse = false, fix = false;
 	const char *skip_str = NULL;
+	char **urls = NULL;
+	int nurls = 0;
 
-	static struct option longopts[] = {
-		{"browse",  no_argument, NULL, 'b'},
-		{"fix",     no_argument, NULL, 'f'},
-		{"model",   required_argument, NULL, 'm'},
-		{"skip",    required_argument, NULL, 's'},
-		{"help",    no_argument, NULL, 'h'},
-		{"version", no_argument, NULL, 'V'},
-		{NULL, 0, NULL, 0}
-	};
-
-	int opt;
-	while ((opt = getopt_long(argc, argv, "bfm:s:hV", longopts, NULL)) != -1) {
-		switch (opt) {
-		case 'b': browse = true; break;
-		case 'f': fix = true; break;
-		case 'm': model = optarg; break;
-		case 's': skip_str = optarg; break;
-		case 'V':
+	for (int i = 1; i < argc; i++) {
+		const char *a = argv[i], *v;
+		if (is_arg(a, "--browse") || is_arg(a, "-b")) {
+			browse = true;
+		} else if (is_arg(a, "--fix") || is_arg(a, "-f")) {
+			fix = true;
+		} else if (is_arg(a, "--model") || is_arg(a, "-m")) {
+			if (++i < argc) model = argv[i];
+		} else if ((v = is_arg_val(a, "--model"))) {
+			model = v;
+		} else if (is_arg(a, "--skip") || is_arg(a, "-s")) {
+			if (++i < argc) skip_str = argv[i];
+		} else if ((v = is_arg_val(a, "--skip"))) {
+			skip_str = v;
+		} else if (is_arg(a, "--version") || is_arg(a, "-V")) {
 			printf("ytran 1.0\n");
 			return 0;
-		case 'h':
+		} else if (is_arg(a, "--help") || is_arg(a, "-h")) {
 			printf("Usage: ytran [OPTIONS] [VIDEO_URL_OR_ID ...]\n"
 			       "  --browse        Browse the transcript database\n"
 			       "  --fix           Fill in missing fields\n"
@@ -1119,7 +1131,12 @@ int main(int argc, char **argv)
 			       "  --skip IDs      Comma-separated video IDs to skip\n"
 			       "  --version       Show version\n", model);
 			return 0;
-		default: return 1;
+		} else if (a[0] == '-') {
+			fprintf(stderr, "Unknown option: %s\n", a);
+			return 1;
+		} else {
+			urls = realloc(urls, (nurls + 1) * sizeof(char *));
+			urls[nurls++] = argv[i];
 		}
 	}
 
@@ -1133,15 +1150,14 @@ int main(int argc, char **argv)
 	}
 	free(xdg);
 
-	if (browse) {
+	/* no arguments at all: default to browse */
+	if (!fix && !browse && nurls < 1)
+		browse = true;
+
+	/* browse-only: no URLs to process, go straight to the browser */
+	if (browse && !fix && nurls < 1) {
 		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos", (char *)NULL);
 		perror("browse-sqlite3");
-		return 1;
-	}
-
-	int nvids = argc - optind;
-	if (!fix && nvids < 1) {
-		fprintf(stderr, "Usage: ytran [--browse|--fix] [VIDEO_URL_OR_ID ...]\n");
 		return 1;
 	}
 
@@ -1286,9 +1302,9 @@ int main(int argc, char **argv)
 		printf("Fix complete\n");
 	}
 
-	if (!fix && nvids > 0) {
-		for (int vi = optind; vi < argc; vi++) {
-			char *video_id = extract_youtube_id(argv[vi]);
+	if (!fix && nurls > 0) {
+		for (int vi = 0; vi < nurls; vi++) {
+			char *video_id = extract_youtube_id(urls[vi]);
 			if (!video_id) continue;
 
 			/* Check if already exists */
@@ -1317,11 +1333,17 @@ int main(int argc, char **argv)
 	if (total_cost > 0)
 		printf("Total API cost: $%.4f\n", total_cost);
 	printf("Database updated: %s\n", db_file);
+	if (browse) {
+		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos", (char *)NULL);
+		perror("browse-sqlite3");
+		return 1;
+	}
 	free(db_dir);
 	free(db_file);
 	for (int i = 0; i < nskip; i++) free(skip_ids[i]);
 	free(skip_ids);
 	free(transcript_api_key);
 	free(anthropic_api_key);
+	free(urls);
 	return 0;
 }
