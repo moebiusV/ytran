@@ -712,7 +712,8 @@ static void db_init(sqlite3 *db)
 		"video_id TEXT PRIMARY KEY, title TEXT, upload_date TEXT, "
 		"duration TEXT, description TEXT, channel_id TEXT, language TEXT, "
 		"raw_transcript TEXT, transcript_formatted TEXT, "
-		"summary_short TEXT, summary_full TEXT, fetched_at TEXT)", NULL, NULL, NULL);
+		"summary_short TEXT, summary_full TEXT, fetched_at TEXT, "
+		"raw_only INTEGER DEFAULT 0)", NULL, NULL, NULL);
 
 	/* Migrate old channel_names schema if needed */
 	sqlite3_stmt *st;
@@ -766,6 +767,9 @@ static void db_init(sqlite3 *db)
 		sqlite3_exec(db, sql, NULL, NULL, NULL); /* ignore error if exists */
 	}
 
+	sqlite3_exec(db, "ALTER TABLE videos ADD COLUMN raw_only INTEGER DEFAULT 0",
+		NULL, NULL, NULL);
+
 	/* Drop vestigial transcript column */
 	sqlite3_exec(db, "ALTER TABLE videos DROP COLUMN transcript", NULL, NULL, NULL);
 }
@@ -789,20 +793,21 @@ static void fill(char **dst, char *src)
 
 /* ── process_video ── */
 
-static void process_video(const char *video_id, sqlite3 *db)
+static void process_video(const char *video_id, sqlite3 *db, bool no_summary)
 {
 	char *title = NULL, *upload_date = NULL, *duration = NULL;
 	char *description = NULL, *channel_id = NULL, *language = NULL;
 	char *raw_transcript = NULL, *transcript_formatted = NULL;
 	char *summary_short = NULL, *summary_full = NULL, *fetched_at = NULL;
 	char *channel_name = NULL, *channel_handle = NULL;
+	int raw_only = 0;
 
 	/* Load existing row */
 	sqlite3_stmt *st;
 	sqlite3_prepare_v2(db,
 		"SELECT title, upload_date, duration, description, channel_id, "
 		"language, raw_transcript, transcript_formatted, summary_short, "
-		"summary_full, fetched_at FROM videos WHERE video_id = ?", -1, &st, NULL);
+		"summary_full, fetched_at, raw_only FROM videos WHERE video_id = ?", -1, &st, NULL);
 	sqlite3_bind_text(st, 1, video_id, -1, SQLITE_STATIC);
 	if (sqlite3_step(st) == SQLITE_ROW) {
 		title = db_text(st, 0); upload_date = db_text(st, 1);
@@ -811,8 +816,10 @@ static void process_video(const char *video_id, sqlite3 *db)
 		raw_transcript = db_text(st, 6); transcript_formatted = db_text(st, 7);
 		summary_short = db_text(st, 8); summary_full = db_text(st, 9);
 		fetched_at = db_text(st, 10);
+		raw_only = sqlite3_column_int(st, 11);
 	}
 	sqlite3_finalize(st);
+	raw_only = no_summary ? 1 : 0;
 
 	if (!fetched_at) {
 		time_t now = time(NULL);
@@ -953,6 +960,12 @@ static void process_video(const char *video_id, sqlite3 *db)
 	bool needs_full = EMPTY(summary_full) && (!EMPTY(transcript_formatted) || needs_format);
 	bool needs_short = EMPTY(summary_short) && (!EMPTY(summary_full) || needs_full);
 
+	if (raw_only) {
+		needs_format = false;
+		needs_full = false;
+		needs_short = false;
+	}
+
 	if (!EMPTY(raw_transcript) && (needs_format || needs_full || needs_short)) {
 		char *stripped = strip_timestamps(raw_transcript);
 		if (asprintf(&cached_prefix, "Title: %s\nDescription: %s\n\nTranscript:\n%s",
@@ -1060,7 +1073,7 @@ static void process_video(const char *video_id, sqlite3 *db)
 		"INSERT OR REPLACE INTO videos "
 		"(video_id, title, upload_date, duration, description, channel_id, "
 		"language, raw_transcript, transcript_formatted, summary_short, "
-		"summary_full, fetched_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+		"summary_full, fetched_at, raw_only) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		-1, &st, NULL);
 	sqlite3_bind_text(st,  1, video_id, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st,  2, title, -1, SQLITE_STATIC);
@@ -1074,6 +1087,7 @@ static void process_video(const char *video_id, sqlite3 *db)
 	sqlite3_bind_text(st, 10, summary_short, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st, 11, summary_full, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st, 12, fetched_at, -1, SQLITE_STATIC);
+	sqlite3_bind_int(st, 13, raw_only);
 	sqlite3_step(st);
 	sqlite3_finalize(st);
 
@@ -1101,7 +1115,7 @@ static const char *is_arg_val(const char *a, const char *opt)
 
 int main(int argc, char **argv)
 {
-	bool browse = false, fix = false;
+	bool browse = false, fix = false, no_summary = false, force = false;
 	const char *skip_str = NULL;
 	char **urls = NULL;
 	int nurls = 0;
@@ -1120,6 +1134,10 @@ int main(int argc, char **argv)
 			if (++i < argc) skip_str = argv[i];
 		} else if ((v = is_arg_val(a, "--skip"))) {
 			skip_str = v;
+		} else if (is_arg(a, "--no-summary") || is_arg(a, "-n")) {
+			no_summary = true;
+		} else if (is_arg(a, "--force")) {
+			force = true;
 		} else if (is_arg(a, "--version") || is_arg(a, "-V")) {
 			printf("ytran 1.0\n");
 			return 0;
@@ -1127,7 +1145,9 @@ int main(int argc, char **argv)
 			printf("Usage: ytran [OPTIONS] [VIDEO_URL_OR_ID ...]\n"
 			       "  --browse        Browse the transcript database\n"
 			       "  --fix           Fill in missing fields\n"
+			       "  --force         With --fix, include raw-only entries\n"
 			       "  --model MODEL   Claude model [%s]\n"
+			       "  --no-summary    Fetch metadata and transcript only\n"
 			       "  --skip IDs      Comma-separated video IDs to skip\n"
 			       "  --version       Show version\n", model);
 			return 0;
@@ -1173,7 +1193,7 @@ int main(int argc, char **argv)
 		fprintf(stderr, "Get a key at https://transcriptapi.com and save it to that file.\n");
 		return 1;
 	}
-	if (!anthropic_api_key) {
+	if (!anthropic_api_key && !no_summary) {
 		fprintf(stderr, "Error: %s/.anthropic_api_key not found\n", home);
 		fprintf(stderr, "Get a key at https://console.anthropic.com/settings/keys and save it to that file.\n");
 		return 1;
@@ -1207,16 +1227,19 @@ int main(int argc, char **argv)
 		g_fix_mode = true;
 		/* Collect all IDs first to avoid modifying table while iterating */
 		sqlite3_stmt *st;
-		sqlite3_prepare_v2(db,
+		char fix_sql[1024];
+		snprintf(fix_sql, sizeof(fix_sql),
 			"SELECT video_id, title FROM videos WHERE "
-			"title = '' OR upload_date = '' OR duration = '' OR description = '' OR "
+			"(title = '' OR upload_date = '' OR duration = '' OR description = '' OR "
 			"channel_id = '' OR language = '' OR raw_transcript = '' OR "
 			"transcript_formatted = '' OR summary_short = '' OR summary_full = '' OR "
 			"title IS NULL OR upload_date IS NULL OR duration IS NULL OR "
 			"description IS NULL OR channel_id IS NULL OR language IS NULL OR "
 			"raw_transcript IS NULL OR transcript_formatted IS NULL OR "
-			"summary_short IS NULL OR summary_full IS NULL OR length(description) <= 200",
-			-1, &st, NULL);
+			"summary_short IS NULL OR summary_full IS NULL OR length(description) <= 200)"
+			"%s",
+			force ? "" : " AND (raw_only IS NULL OR raw_only = 0)");
+		sqlite3_prepare_v2(db, fix_sql, -1, &st, NULL);
 		typedef struct { char *id; char *title; } FixEntry;
 		FixEntry *fix_entries = NULL;
 		int nfix = 0;
@@ -1238,7 +1261,7 @@ int main(int argc, char **argv)
 			printf("%s %s", fix_entries[i].id,
 				fix_entries[i].title ? fix_entries[i].title : "");
 			fflush(stdout);
-			process_video(fix_entries[i].id, db);
+			process_video(fix_entries[i].id, db, false);
 			free(fix_entries[i].id);
 			free(fix_entries[i].title);
 		}
@@ -1322,7 +1345,7 @@ int main(int argc, char **argv)
 			if (exists) {
 				printf("Transcript already downloaded for %s. Skipping.\n", video_id);
 			} else {
-				process_video(video_id, db);
+				process_video(video_id, db, no_summary);
 			}
 			free(video_id);
 		}

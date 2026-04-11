@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# ytchan - download transcripts for an entire YouTube channel
+# Usage: ytchan [ytran options] <channel_url>
+
+if [ $# -lt 1 ]; then
+    echo "Usage: ytchan [ytran options] <channel_url>"
+    exit 1
+fi
+
+ARGS=("$@")
+CHANNEL_URL="${ARGS[-1]}"
+YTRAN_OPTS=("--no-summary" "${ARGS[@]:0:$#-1}")
+
+echo "Fetching video list from: $CHANNEL_URL"
+mapfile -t URLS < <(yt-dlp --flat-playlist --print url "$CHANNEL_URL" 2>/dev/null)
+
+echo "Found ${#URLS[@]} videos"
+
+for i in "${!URLS[@]}"; do
+    echo "[$((i+1))/${#URLS[@]}] ${URLS[$i]}"
+    ytran "${YTRAN_OPTS[@]}" "${URLS[$i]}"
+done

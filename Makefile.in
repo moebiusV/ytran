@@ -26,11 +26,13 @@ src/ytran: src/ytran.c $(CJSON_SRC)
 install: src/ytran
 	install -d $(DESTDIR)$(BINDIR)
 	install -m 755 src/ytran $(DESTDIR)$(BINDIR)/ytran
+	install -m 755 ytchan $(DESTDIR)$(BINDIR)/ytchan
 	install -d $(DESTDIR)$(MANDIR)
 	install -m 644 ytran.1 $(DESTDIR)$(MANDIR)/ytran.1
 
 uninstall:
 	rm -f $(DESTDIR)$(BINDIR)/ytran
+	rm -f $(DESTDIR)$(BINDIR)/ytchan
 	rm -f $(DESTDIR)$(MANDIR)/ytran.1
 
 clean:
@@ -51,6 +53,7 @@ dist:
 	cp contrib/ytran.py ytran-1.0/contrib/
 	cp src/ytran.c ytran-1.0/src/
 	cp src/deps/cjson/cJSON.c src/deps/cjson/cJSON.h ytran-1.0/src/deps/cjson/
+	cp ytchan ytran-1.0/
 	cp README.md COPYING AUTHORS NEWS ChangeLog INSTALL ytran.1 ytran-1.0/
 	tar czf ytran-1.0.tar.gz ytran-1.0
 	rm -rf ytran-1.0

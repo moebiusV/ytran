@@ -8,10 +8,9 @@ short summary, full summary) in a local SQLite database.
 
 ## Dependencies
 
-- Python 3.8+
-- [anthropic](https://pypi.org/project/anthropic/) Python SDK
 - A [transcriptapi.com](https://transcriptapi.com) API key (`~/.youtubetotranscript_api_key`)
 - An [Anthropic](https://console.anthropic.com) API key (`~/.anthropic_api_key`)
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp) (required by `ytchan`)
 
 ## Installation
 
@@ -27,8 +26,11 @@ See [INSTALL](INSTALL) for details, including API key setup.
 ytran                        # Browse the transcript database (default)
 ytran <url-or-id> [...]      # Fetch and summarize one or more videos
 ytran -b/--browse [url ...]  # Browse the transcript database
+ytran -n/--no-summary <url>  # Fetch metadata and transcript only (no Claude)
 ytran --fix                  # Fill in missing fields in existing entries
+ytran --fix --force          # Also process raw-only (--no-summary) entries
 ytran --skip ID1,ID2 --fix   # Skip specific video IDs during --fix
+ytchan <channel_url>         # Download transcripts for an entire channel
 ```
 
 Options and URLs may be intermixed in any order.

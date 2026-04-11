@@ -23,10 +23,30 @@ Options and URLs may be intermixed in any order.
 .B \-\-fix
 Scan all database entries and fill in any missing fields (metadata,
 transcripts, summaries).
+Entries saved with
+.B \-\-no\-summary
+are skipped unless
+.B \-\-force
+is also given.
+.TP
+.B \-\-force
+When combined with
+.BR \-\-fix ,
+also process entries that were saved with
+.BR \-\-no\-summary .
+The raw\-only flag is cleared and summaries are generated.
 .TP
 .BI \-\-model " MODEL"
 Claude model to use for formatting and summarization.
 Default: claude-sonnet-4-5.
+.TP
+.BR \-n ", " \-\-no\-summary
+Fetch metadata and raw transcript only; do not format or summarize
+with Claude.
+The entry is flagged as raw\-only so that future
+.B \-\-fix
+runs leave it alone.
+Does not require an Anthropic API key.
 .TP
 .BI \-\-skip " ID1,ID2,..."
 Comma-separated list of video IDs to skip during \-\-fix operations.
@@ -43,6 +63,16 @@ transcriptapi.com bearer token.
 .TP
 .I ~/.anthropic_api_key
 Anthropic API key for Claude.
+.SH SEE ALSO
+.BR ytchan (1)
+\(em download transcripts for an entire YouTube channel.
+Passes
+.B \-\-no\-summary
+by default; accepts additional
+.B ytran
+options before the channel URL.
+Requires
+.BR yt\-dlp .
 .SH AUTHOR
 David Walther <david@clearbrookdistillery.com>
 .SH LICENSE
