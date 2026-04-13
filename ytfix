@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# ytfix - backfill missing raw_transcript records using yt-dlp
+# Finds videos with NULL/empty raw_transcript in the database and
+# downloads captions locally via yt-dlp (bypasses transcriptapi.com).
+# Videos confirmed to have no captions are marked so we don't retry them.
+#
+# Usage: ytfix [--login]
+#   --login   Open Edge, log into YouTube, export cookies for age-restricted videos
+
+DB_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/ytran"
+DB="$DB_DIR/youtube-transcripts.db"
+COOKIE_JAR="$DB_DIR/cookies.txt"
+MIN_DELAY=5         # floor: never faster than 5s
+MAX_DELAY=1800       # ceiling: 30 minutes
+INITIAL_DELAY=10     # starting delay
+BACKOFF_MULT=3       # multiplicative decrease on failure
+DECREASE=2           # additive decrease on success (delay shrinks)
+
+# ── Cookie login flow ──
+
+do_login() {
+    # skip if cookies exist and SID hasn't expired
+    if [ -f "$COOKIE_JAR" ]; then
+        local STILL_VALID
+        STILL_VALID=$(python3 -c "
+import sys, time
+now = int(time.time())
+with open(sys.argv[1]) as f:
+    for line in f:
+        parts = line.strip().split('\t')
+        if len(parts) >= 7 and parts[5] == 'SID' and int(parts[4]) > now:
+            print('yes'); break
+    else:
+        print('no')
+" "$COOKIE_JAR")
+        if [ "$STILL_VALID" = "yes" ]; then
+            echo "Cookies still valid, skipping login."
+            return 0
+        fi
+    fi
+
+    local EDGE="/mnt/c/Program Files (x86)/Microsoft/Edge/Application/msedge.exe"
+    if [ ! -f "$EDGE" ]; then
+        echo "Edge not found at: $EDGE" >&2
+        exit 1
+    fi
+
+    local WIN_PROFILE
+    WIN_PROFILE=$(powershell.exe -Command 'Write-Output "$env:TEMP\ytfix_edge_profile"' 2>/dev/null | tr -d '\r')
+    local WSL_PROFILE="/mnt/c/Users/${WIN_PROFILE#C:\\Users\\}"
+    WSL_PROFILE="${WSL_PROFILE//\\//}"
+
+    # clean previous profile
+    powershell.exe -Command "
+        if (Test-Path '$WIN_PROFILE') { Remove-Item '$WIN_PROFILE' -Recurse -Force }
+    " 2>/dev/null
+
+    echo "Opening Edge — log into YouTube, then close the browser."
+    "$EDGE" --user-data-dir="$WIN_PROFILE" "https://accounts.google.com/ServiceLogin?continue=https://www.youtube.com/" 2>/dev/null &
+    local EDGE_PID=$!
+
+    # wait for browser to close
+    echo "Waiting for Edge to close..."
+    while powershell.exe -Command "Get-Process msedge -ErrorAction SilentlyContinue | Where-Object { \$_.CommandLine -like '*ytfix_edge_profile*' }" 2>/dev/null | grep -q msedge; do
+        sleep 2
+    done
+    wait $EDGE_PID 2>/dev/null
+
+    echo "Extracting cookies..."
+
+    # decrypt master key via DPAPI (Windows-side), then extract cookies via Python
+    local MASTER_KEY_B64
+    MASTER_KEY_B64=$(powershell.exe -Command "
+        Add-Type -AssemblyName System.Security
+        \$ls = Get-Content '$WIN_PROFILE\Local State' | ConvertFrom-Json
+        \$ek = [System.Convert]::FromBase64String(\$ls.os_crypt.encrypted_key)
+        \$ek = \$ek[5..(\$ek.Length-1)]
+        \$dk = [System.Security.Cryptography.ProtectedData]::Unprotect(\$ek, \$null, 'CurrentUser')
+        [System.Convert]::ToBase64String(\$dk)
+    " 2>/dev/null | tr -d '\r')
+
+    if [ -z "$MASTER_KEY_B64" ]; then
+        echo "Failed to decrypt cookie key" >&2
+        return 1
+    fi
+
+    local COOKIES_DB="$WSL_PROFILE/Default/Network/Cookies"
+    if [ ! -f "$COOKIES_DB" ]; then
+        echo "Cookie database not found at: $COOKIES_DB" >&2
+        return 1
+    fi
+
+    python3 -c "
+import base64, sqlite3, sys
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+master_key = base64.b64decode(sys.argv[1])
+db = sqlite3.connect(sys.argv[2])
+rows = db.execute(
+    'SELECT host_key, path, is_secure, expires_utc, name, encrypted_value '
+    'FROM cookies WHERE host_key LIKE \"%youtube.com\" OR host_key LIKE \"%google.com\"'
+).fetchall()
+db.close()
+
+aes = AESGCM(master_key)
+out = open(sys.argv[3], 'w')
+out.write('# Netscape HTTP Cookie File\n')
+for host, path, secure, expires, name, enc_val in rows:
+    if enc_val[:3] in (b'v10', b'v20'):
+        nonce = enc_val[3:15]
+        pt = aes.decrypt(nonce, enc_val[15:], None)
+        val = pt[32:].decode('utf-8', errors='replace')
+    else:
+        val = enc_val.decode('utf-8', errors='replace')
+    # Chrome expires_utc is microseconds since 1601-01-01; convert to unix epoch
+    unix_exp = max(0, (expires - 11644473600000000) // 1000000) if expires else 0
+    secure_str = 'TRUE' if secure else 'FALSE'
+    incl_sub = 'TRUE' if host.startswith('.') else 'FALSE'
+    out.write(f'{host}\t{incl_sub}\t{path}\t{secure_str}\t{unix_exp}\t{name}\t{val}\n')
+out.close()
+print(f'Exported {len(rows)} cookies')
+" "$MASTER_KEY_B64" "$COOKIES_DB" "$COOKIE_JAR"
+
+    # clean up temp profile
+    powershell.exe -Command "
+        Remove-Item '$WIN_PROFILE' -Recurse -Force -ErrorAction SilentlyContinue
+    " 2>/dev/null
+
+    if [ -f "$COOKIE_JAR" ]; then
+        echo "Cookies saved to $COOKIE_JAR"
+    else
+        echo "Cookie export failed" >&2
+        return 1
+    fi
+}
+
+# ── Main ──
+
+if [ "$1" = "--login" ]; then
+    do_login
+    exit $?
+fi
+
+if [ ! -f "$DB" ]; then
+    echo "Database not found: $DB" >&2
+    exit 1
+fi
+
+COOKIE_OPTS=()
+if [ -f "$COOKIE_JAR" ]; then
+    COOKIE_OPTS=(--cookies "$COOKIE_JAR")
+    echo "Using saved cookies for age-restricted videos"
+fi
+
+TMPDIR=$(mktemp -d)
+trap 'rm -rf "$TMPDIR"' EXIT
+
+# Ensure state table exists for resume-on-restart
+sqlite3 "$DB" "CREATE TABLE IF NOT EXISTS queue_state (queue_name TEXT PRIMARY KEY, last_video_id TEXT)"
+
+# Build work queue — failed downloads get re-queued at the back
+mapfile -t QUEUE < <(sqlite3 "$DB" \
+    "SELECT video_id FROM videos WHERE raw_transcript IS NULL OR raw_transcript = ''")
+
+if [ ${#QUEUE[@]} -eq 0 ]; then
+    echo "No records to fix."
+    exit 0
+fi
+
+# Resume from where we left off last run
+LAST_VID=$(sqlite3 "$DB" "SELECT last_video_id FROM queue_state WHERE queue_name = 'ytfix'" 2>/dev/null)
+if [ -n "$LAST_VID" ]; then
+    for j in "${!QUEUE[@]}"; do
+        if [ "${QUEUE[$j]}" = "$LAST_VID" ]; then
+            QUEUE=("${QUEUE[@]:$((j+1))}" "${QUEUE[@]:0:$((j+1))}")
+            echo "Resuming after $LAST_VID"
+            break
+        fi
+    done
+fi
+
+TOTAL=${#QUEUE[@]}
+echo "Found $TOTAL videos with missing transcripts"
+
+FIXED=0
+EMPTY=0
+MARKED=0
+DELAY=$INITIAL_DELAY
+CEILING_FAILS=0
+
+while [ ${#QUEUE[@]} -gt 0 ]; do
+    VID="${QUEUE[0]}"
+    QUEUE=("${QUEUE[@]:1}")
+
+    echo -n "[$FIXED fixed, $((${#QUEUE[@]} + 1)) remaining of $TOTAL] $VID — "
+
+    # save position for resume-on-restart
+    sqlite3 "$DB" "INSERT OR REPLACE INTO queue_state VALUES ('ytfix', '$VID')"
+
+    # clean temp dir between runs
+    rm -f "$TMPDIR"/*
+
+    # prefer manual subs, fall back to auto-generated
+    YTDLP_ERR=$(yt-dlp --skip-download \
+        --write-subs --write-auto-subs \
+        --sub-lang en --sub-format json3 \
+        "${COOKIE_OPTS[@]}" \
+        -o "$TMPDIR/%(id)s" \
+        "https://www.youtube.com/watch?v=$VID" \
+        2>&1 >/dev/null)
+    YTDLP_RC=$?
+
+    # pick best subtitle file: manual over auto
+    SUB_FILE=""
+    for f in "$TMPDIR"/"$VID".en.json3 "$TMPDIR"/"$VID".*.json3; do
+        if [ -f "$f" ]; then
+            SUB_FILE="$f"
+            break
+        fi
+    done
+
+    if [ -n "$SUB_FILE" ]; then
+        # extract language from filename: VID.LANG.json3
+        LANG=$(basename "$SUB_FILE" .json3)
+        LANG="${LANG#"$VID".}"
+
+        # parse json3 and update DB (python handles quoting safely)
+        python3 -c "
+import json, sys, sqlite3
+
+with open(sys.argv[1]) as f:
+    data = json.load(f)
+lines = []
+for ev in data.get('events', []):
+    segs = ev.get('segs')
+    if not segs:
+        continue
+    text = ''.join(s.get('utf8', '') for s in segs).strip()
+    if not text:
+        continue
+    start = ev['tStartMs'] / 1000.0
+    lines.append(f'{start:.2f}: {text}')
+transcript = '\n'.join(lines)
+if not transcript:
+    sys.exit(1)
+db = sqlite3.connect(sys.argv[2])
+db.execute('UPDATE videos SET raw_transcript = ?, language = ? WHERE video_id = ?',
+           (transcript, sys.argv[3], sys.argv[4]))
+db.commit()
+db.close()
+" "$SUB_FILE" "$DB" "$LANG" "$VID" 2>/dev/null
+
+        if [ $? -eq 0 ]; then
+            echo "OK"
+            FIXED=$((FIXED + 1))
+            CEILING_FAILS=0
+            # additive decrease: speed up on success
+            DELAY=$((DELAY - DECREASE))
+            [ "$DELAY" -lt "$MIN_DELAY" ] && DELAY=$MIN_DELAY
+        else
+            echo "empty transcript"
+            EMPTY=$((EMPTY + 1))
+            # empty parse isn't YouTube's fault — don't back off
+        fi
+    elif echo "$YTDLP_ERR" | grep -q "no subtitles for the requested languages"; then
+        # video genuinely has no captions — mark it so we don't retry
+        sqlite3 "$DB" "UPDATE videos SET raw_transcript = '[no captions]' WHERE video_id = '$VID'"
+        echo "no captions (marked)"
+        MARKED=$((MARKED + 1))
+        # not a block — don't back off
+    else
+        # transient failure (throttled, network, etc.) — re-queue for retry
+        QUEUE+=("$VID")
+        echo "failed — re-queued (${#QUEUE[@]} remaining)"
+        # multiplicative increase: back off hard
+        DELAY=$((DELAY * BACKOFF_MULT))
+        if [ "$DELAY" -ge "$MAX_DELAY" ]; then
+            DELAY=$MAX_DELAY
+            CEILING_FAILS=$((CEILING_FAILS + 1))
+            if [ "$CEILING_FAILS" -ge 4 ]; then
+                echo "Giving up: 4 failures at max backoff"
+                break
+            fi
+        else
+            CEILING_FAILS=0
+        fi
+    fi
+
+    # rate limit with jitter (±20%)
+    if [ ${#QUEUE[@]} -gt 0 ]; then
+        JITTER=$(( (RANDOM % (DELAY * 4 / 10 + 1)) - DELAY * 2 / 10 ))
+        ACTUAL=$((DELAY + JITTER))
+        [ "$ACTUAL" -lt "$MIN_DELAY" ] && ACTUAL=$MIN_DELAY
+        if [ -t 1 ]; then
+            # interactive terminal — show countdown
+            for (( LEFT=ACTUAL; LEFT>0; LEFT-- )); do
+                printf "\r    waiting %ds " "$LEFT"
+                sleep 1
+            done
+            printf "\r%*s\r" $((ACTUAL < 100 ? 19 : 20)) ""
+        else
+            if [ "$ACTUAL" -ge 60 ]; then
+                echo "    waiting ${ACTUAL}s ($(( ACTUAL / 60 ))m$(( ACTUAL % 60 ))s)..."
+            else
+                echo "    waiting ${ACTUAL}s..."
+            fi
+            sleep "$ACTUAL"
+        fi
+    fi
+done
+
+GAVE_UP=${#QUEUE[@]}
+sqlite3 "$DB" "DELETE FROM queue_state WHERE queue_name = 'ytfix'"
+echo "Done: $FIXED fixed, $MARKED marked no captions, $EMPTY empty, $GAVE_UP gave up"
