@@ -1248,8 +1248,8 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	/* Build cached prefix for Claude calls */
 	char *cached_prefix = NULL;
 	bool needs_format = EMPTY(transcript_formatted) && !EMPTY(raw_transcript);
-	bool needs_full = EMPTY(summary_full) && (!EMPTY(transcript_formatted) || needs_format);
-	bool needs_short = EMPTY(summary_short) && (!EMPTY(summary_full) || needs_full);
+	bool needs_full = EMPTY(summary_full) && !EMPTY(raw_transcript);
+	bool needs_short = EMPTY(summary_short) && !EMPTY(raw_transcript);
 
 	if (raw_only) {
 		needs_format = false;
@@ -1298,7 +1298,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	}
 
 	/* Generate full summary */
-	if (needs_full && !EMPTY(transcript_formatted)) {
+	if (needs_full) {
 		if (!g_fix_mode) {
 			printf("Generating full summary for %s", video_id);
 			fflush(stdout);
@@ -1326,7 +1326,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	}
 
 	/* Generate short summary */
-	if (needs_short && (!EMPTY(summary_full) || !EMPTY(transcript_formatted))) {
+	if (needs_short) {
 		if (!g_fix_mode) {
 			printf("Generating short summary for %s", video_id);
 			fflush(stdout);
