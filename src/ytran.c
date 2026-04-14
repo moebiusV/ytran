@@ -993,7 +993,7 @@ static void db_init(sqlite3 *db)
 		"duration TEXT, description TEXT, channel_id TEXT, language TEXT, "
 		"raw_transcript TEXT, transcript_formatted TEXT, "
 		"summary_short TEXT, summary_full TEXT, fetched_at TEXT, "
-		"raw_only INTEGER DEFAULT 0)", NULL, NULL, NULL);
+		"raw_only INTEGER DEFAULT 0, updated_at TEXT)", NULL, NULL, NULL);
 
 	/* Migrate old channel_names schema if needed */
 	sqlite3_stmt *st;
@@ -1049,6 +1049,8 @@ static void db_init(sqlite3 *db)
 
 	sqlite3_exec(db, "ALTER TABLE videos ADD COLUMN raw_only INTEGER DEFAULT 0",
 		NULL, NULL, NULL);
+	sqlite3_exec(db, "ALTER TABLE videos ADD COLUMN updated_at TEXT",
+		NULL, NULL, NULL);
 
 	/* Drop vestigial transcript column */
 	sqlite3_exec(db, "ALTER TABLE videos DROP COLUMN transcript", NULL, NULL, NULL);
@@ -1067,9 +1069,9 @@ static char *db_text(sqlite3_stmt *st, int col)
 #define EMPTY(s) (!(s) || !*(s))
 
 /* Replace dst with src if dst is empty. Takes ownership of src. */
-static void fill(char **dst, char *src)
+static void fill(char **dst, char *src, bool *changed)
 {
-	if (EMPTY(*dst) && !EMPTY(src)) { free(*dst); *dst = src; }
+	if (EMPTY(*dst) && !EMPTY(src)) { free(*dst); *dst = src; *changed = true; }
 	else free(src);
 }
 
@@ -1080,16 +1082,19 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	char *title = NULL, *upload_date = NULL, *duration = NULL;
 	char *description = NULL, *channel_id = NULL, *language = NULL;
 	char *raw_transcript = NULL, *transcript_formatted = NULL;
-	char *summary_short = NULL, *summary_full = NULL, *fetched_at = NULL;
+	char *summary_short = NULL, *summary_full = NULL;
+	char *fetched_at = NULL, *updated_at = NULL;
 	char *channel_name = NULL, *channel_handle = NULL;
 	int raw_only = 0;
+	bool changed = false;
 
 	/* Load existing row */
 	sqlite3_stmt *st;
 	sqlite3_prepare_v2(db,
 		"SELECT title, upload_date, duration, description, channel_id, "
 		"language, raw_transcript, transcript_formatted, summary_short, "
-		"summary_full, fetched_at, raw_only FROM videos WHERE video_id = ?", -1, &st, NULL);
+		"summary_full, fetched_at, raw_only, updated_at "
+		"FROM videos WHERE video_id = ?", -1, &st, NULL);
 	sqlite3_bind_text(st, 1, video_id, -1, SQLITE_STATIC);
 	if (sqlite3_step(st) == SQLITE_ROW) {
 		title = db_text(st, 0); upload_date = db_text(st, 1);
@@ -1099,9 +1104,12 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		summary_short = db_text(st, 8); summary_full = db_text(st, 9);
 		fetched_at = db_text(st, 10);
 		raw_only = sqlite3_column_int(st, 11);
+		updated_at = db_text(st, 12);
 	}
 	sqlite3_finalize(st);
+	int old_raw_only = raw_only;
 	raw_only = no_summary ? 1 : 0;
+	if (raw_only != old_raw_only) changed = true;
 
 	if (!fetched_at) {
 		time_t now = time(NULL);
@@ -1132,18 +1140,19 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 			else
 				buf_printf(&fix_line, " metadata");
 		}
-		fill(&title, m.title); m.title = NULL;
-		fill(&upload_date, m.upload_date); m.upload_date = NULL;
-		fill(&duration, m.duration); m.duration = NULL;
+		fill(&title, m.title, &changed); m.title = NULL;
+		fill(&upload_date, m.upload_date, &changed); m.upload_date = NULL;
+		fill(&duration, m.duration, &changed); m.duration = NULL;
 		if (EMPTY(description) || (desc_truncated && m.description &&
 		    strlen(m.description) > strlen(description))) {
 			free(description);
 			description = m.description;
+			changed = true;
 		} else {
 			free(m.description);
 		}
 		m.description = NULL;
-		fill(&channel_id, m.channel_id); m.channel_id = NULL;
+		fill(&channel_id, m.channel_id, &changed); m.channel_id = NULL;
 		channel_name = m.channel_name; m.channel_name = NULL;
 		channel_handle = m.channel_handle; m.channel_handle = NULL;
 		metadata_free(&m);
@@ -1232,8 +1241,8 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 			else
 				buf_printf(&fix_line, " transcript");
 		}
-		if (rt) { free(raw_transcript); raw_transcript = rt; }
-		if (lang) { free(language); language = lang; }
+		if (rt) { free(raw_transcript); raw_transcript = rt; changed = true; }
+		if (lang) { free(language); language = lang; changed = true; }
 	}
 
 	/* Build cached prefix for Claude calls */
@@ -1285,6 +1294,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		free(transcript_formatted);
 		transcript_formatted = wordwrap(raw);
 		free(raw);
+		changed = true;
 	}
 
 	/* Generate full summary */
@@ -1312,6 +1322,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		free(summary_full);
 		summary_full = wordwrap(raw);
 		free(raw);
+		changed = true;
 	}
 
 	/* Generate short summary */
@@ -1337,6 +1348,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		free(summary_short);
 		summary_short = wordwrap(raw);
 		free(raw);
+		changed = true;
 	}
 
 	free(cached_prefix);
@@ -1350,12 +1362,22 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		buf_free(&fix_line);
 	}
 
+	/* Set updated_at only if data changed */
+	if (changed) {
+		free(updated_at);
+		time_t now = time(NULL);
+		struct tm *tm = localtime(&now);
+		updated_at = malloc(32);
+		strftime(updated_at, 32, "%Y-%m-%dT%H:%M:%S", tm);
+	}
+
 	/* Upsert */
 	sqlite3_prepare_v2(db,
 		"INSERT OR REPLACE INTO videos "
 		"(video_id, title, upload_date, duration, description, channel_id, "
 		"language, raw_transcript, transcript_formatted, summary_short, "
-		"summary_full, fetched_at, raw_only) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+		"summary_full, fetched_at, raw_only, updated_at) "
+		"VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
 		-1, &st, NULL);
 	sqlite3_bind_text(st,  1, video_id, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st,  2, title, -1, SQLITE_STATIC);
@@ -1370,6 +1392,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	sqlite3_bind_text(st, 11, summary_full, -1, SQLITE_STATIC);
 	sqlite3_bind_text(st, 12, fetched_at, -1, SQLITE_STATIC);
 	sqlite3_bind_int(st, 13, raw_only);
+	sqlite3_bind_text(st, 14, updated_at, -1, SQLITE_STATIC);
 	sqlite3_step(st);
 	sqlite3_finalize(st);
 
@@ -1387,7 +1410,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	free(title); free(upload_date); free(duration); free(description);
 	free(channel_id); free(language); free(raw_transcript);
 	free(transcript_formatted); free(summary_short); free(summary_full);
-	free(fetched_at); free(channel_name); free(channel_handle);
+	free(fetched_at); free(updated_at); free(channel_name); free(channel_handle);
 	return result;
 }
 
@@ -1514,8 +1537,7 @@ static const char *is_arg_val(const char *a, const char *opt)
 
 int main(int argc, char **argv)
 {
-	bool browse = false, fix = false, fix_all = false;
-	bool no_summary = false, force = false;
+	bool browse = false, fix = false, fix_full = false, no_summary = false;
 	const char *skip_str = NULL;
 	int opt_max_backoff = 1800, opt_min_delay = 5, opt_initial_delay = 10;
 	char **urls = NULL;
@@ -1527,8 +1549,8 @@ int main(int argc, char **argv)
 			browse = true;
 		} else if (is_arg(a, "--fix") || is_arg(a, "-f")) {
 			fix = true;
-		} else if (is_arg(a, "--fix-all") || is_arg(a, "-F")) {
-			fix_all = true;
+		} else if (is_arg(a, "--fix-full") || is_arg(a, "-F")) {
+			fix_full = true;
 		} else if (is_arg(a, "--model") || is_arg(a, "-m")) {
 			if (++i < argc) model = argv[i];
 		} else if ((v = is_arg_val(a, "--model"))) {
@@ -1539,8 +1561,6 @@ int main(int argc, char **argv)
 			skip_str = v;
 		} else if (is_arg(a, "--no-summary") || is_arg(a, "-n")) {
 			no_summary = true;
-		} else if (is_arg(a, "--force")) {
-			force = true;
 		} else if (is_arg(a, "--max-backoff")) {
 			if (++i < argc) opt_max_backoff = atoi(argv[i]);
 		} else if ((v = is_arg_val(a, "--max-backoff"))) {
@@ -1560,8 +1580,7 @@ int main(int argc, char **argv)
 			printf("Usage: ytran [OPTIONS] [URL_OR_ID_OR_CHANNEL ...]\n"
 			       "  --browse            Browse the transcript database\n"
 			       "  --fix               Fill in missing fields (with backoff)\n"
-			       "  --fix-all VID ...   Summarize specific raw-only videos\n"
-			       "  --force             With --fix, include raw-only entries\n"
+			       "  --fix-full [VID ...] Like --fix, but includes raw-only videos\n"
 			       "  --model MODEL       Claude model [%s]\n"
 			       "  --no-summary        Fetch metadata and transcript only\n"
 			       "  --skip IDs          Comma-separated video IDs to skip\n"
@@ -1592,11 +1611,11 @@ int main(int argc, char **argv)
 	free(xdg);
 
 	/* no arguments at all: default to browse */
-	if (!fix && !browse && nurls < 1)
+	if (!fix && !fix_full && !browse && nurls < 1)
 		browse = true;
 
 	/* browse-only: no URLs to process, go straight to the browser */
-	if (browse && !fix && nurls < 1) {
+	if (browse && !fix && !fix_full && nurls < 1) {
 		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos", (char *)NULL);
 		perror("browse-sqlite3");
 		return 1;
@@ -1651,7 +1670,7 @@ int main(int argc, char **argv)
 	Backoff bo;
 	backoff_init(&bo, opt_min_delay, opt_max_backoff, opt_initial_delay, 3, 2);
 
-	if (fix) {
+	if (fix || (fix_full && nurls == 0)) {
 		g_fix_mode = true;
 		/* Build queue from videos with missing fields */
 		sqlite3_stmt *st;
@@ -1666,7 +1685,7 @@ int main(int argc, char **argv)
 			"raw_transcript IS NULL OR transcript_formatted IS NULL OR "
 			"summary_short IS NULL OR summary_full IS NULL OR length(description) <= 200)"
 			"%s",
-			force ? "" : " AND (raw_only IS NULL OR raw_only = 0)");
+			fix_full ? "" : " AND (raw_only IS NULL OR raw_only = 0)");
 		sqlite3_prepare_v2(db, fix_sql, -1, &st, NULL);
 		VideoQueue fixq;
 		queue_init(&fixq);
@@ -1745,30 +1764,30 @@ int main(int argc, char **argv)
 		free(ch_fixes);
 	}
 
-	if (fix_all && nurls > 0) {
+	if (fix_full && nurls > 0) {
 		/* Process specific videos with full summarization */
-		VideoQueue faq;
-		queue_init(&faq);
+		VideoQueue ffq;
+		queue_init(&ffq);
 		for (int i = 0; i < nurls; i++) {
 			char *video_id = extract_youtube_id(urls[i]);
 			if (video_id) {
-				queue_push(&faq, video_id);
+				queue_push(&ffq, video_id);
 				free(video_id);
 			}
 		}
-		if (faq.count == 1) {
-			char *vid = queue_pop(&faq);
+		if (ffq.count == 1) {
+			char *vid = queue_pop(&ffq);
 			process_video(vid, db, false);
 			free(vid);
-		} else if (faq.count > 1) {
+		} else if (ffq.count > 1) {
 			backoff_init(&bo, opt_min_delay, opt_max_backoff,
 				opt_initial_delay, 3, 2);
-			run_batch(&faq, db, &bo, false, "fix-all");
+			run_batch(&ffq, db, &bo, false, "fix-full");
 		}
-		queue_free(&faq);
+		queue_free(&ffq);
 	}
 
-	if (!fix && !fix_all && nurls > 0) {
+	if (!fix && !fix_full && nurls > 0) {
 		/* Separate channel URLs from video URLs */
 		char **chan_urls = NULL;
 		int nchans = 0;
