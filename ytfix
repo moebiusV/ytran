@@ -183,7 +183,6 @@ TOTAL=${#QUEUE[@]}
 echo "Found $TOTAL videos with missing transcripts"
 
 FIXED=0
-EMPTY=0
 MARKED=0
 DELAY=$INITIAL_DELAY
 CEILING_FAILS=0
@@ -258,16 +257,26 @@ db.close()
             DELAY=$((DELAY - DECREASE))
             [ "$DELAY" -lt "$MIN_DELAY" ] && DELAY=$MIN_DELAY
         else
-            echo "empty transcript"
-            EMPTY=$((EMPTY + 1))
-            # empty parse isn't YouTube's fault — don't back off
+            sqlite3 "$DB" "UPDATE videos SET raw_transcript = '[empty transcript]' WHERE video_id = '$VID'"
+            echo "empty transcript (marked)"
+            MARKED=$((MARKED + 1))
         fi
     elif echo "$YTDLP_ERR" | grep -q "no subtitles for the requested languages"; then
-        # video genuinely has no captions — mark it so we don't retry
         sqlite3 "$DB" "UPDATE videos SET raw_transcript = '[no captions]' WHERE video_id = '$VID'"
         echo "no captions (marked)"
         MARKED=$((MARKED + 1))
-        # not a block — don't back off
+    elif echo "$YTDLP_ERR" | grep -qi "join this channel\|members.only"; then
+        sqlite3 "$DB" "UPDATE videos SET raw_transcript = '[subscriber only]' WHERE video_id = '$VID'"
+        echo "subscriber only (marked)"
+        MARKED=$((MARKED + 1))
+    elif echo "$YTDLP_ERR" | grep -qi "confirm your age"; then
+        sqlite3 "$DB" "UPDATE videos SET raw_transcript = '[age restricted]' WHERE video_id = '$VID'"
+        echo "age restricted (marked)"
+        MARKED=$((MARKED + 1))
+    elif echo "$YTDLP_ERR" | grep -qi "video unavailable\|private video\|been removed"; then
+        sqlite3 "$DB" "UPDATE videos SET raw_transcript = '[unavailable]' WHERE video_id = '$VID'"
+        echo "unavailable (marked)"
+        MARKED=$((MARKED + 1))
     else
         # transient failure (throttled, network, etc.) — re-queue for retry
         QUEUE+=("$VID")
@@ -279,6 +288,10 @@ db.close()
             CEILING_FAILS=$((CEILING_FAILS + 1))
             if [ "$CEILING_FAILS" -ge 4 ]; then
                 echo "Giving up: 4 failures at max backoff"
+                # mark remaining so they show up in DB for investigation
+                for REMAINING in "${QUEUE[@]}"; do
+                    sqlite3 "$DB" "UPDATE videos SET raw_transcript = '[download failed]' WHERE video_id = '$REMAINING'"
+                done
                 break
             fi
         else
@@ -311,4 +324,4 @@ done
 
 GAVE_UP=${#QUEUE[@]}
 sqlite3 "$DB" "DELETE FROM queue_state WHERE queue_name = 'ytfix'"
-echo "Done: $FIXED fixed, $MARKED marked no captions, $EMPTY empty, $GAVE_UP gave up"
+echo "Done: $FIXED fixed, $MARKED marked, $GAVE_UP gave up"
