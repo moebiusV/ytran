@@ -257,11 +257,16 @@ static char *http_fetch(const char *url, const char *post_body,
 					if (cJSON_IsString(msg))
 						errmsg = msg->valuestring;
 				}
-				/* some APIs put message at top level */
+				/* some APIs put message or detail at top level */
 				if (!errmsg) {
 					cJSON *msg = cJSON_GetObjectItem(err, "message");
 					if (cJSON_IsString(msg))
 						errmsg = msg->valuestring;
+				}
+				if (!errmsg) {
+					cJSON *det = cJSON_GetObjectItem(err, "detail");
+					if (cJSON_IsString(det))
+						errmsg = det->valuestring;
 				}
 				snprintf(g_last_http_detail, sizeof(g_last_http_detail),
 					"HTTP %ld: %s", code, errmsg ? errmsg : "");
@@ -426,7 +431,7 @@ static int backoff_jittered_delay(Backoff *b)
 static void wait_with_countdown(int seconds)
 {
 	if (isatty(STDOUT_FILENO)) {
-		for (int left = seconds; left > 0; left--) {
+		for (int left = seconds; left > 0 && !g_interrupted; left--) {
 			printf("\r    waiting %ds ", left);
 			fflush(stdout);
 			sleep(1);
@@ -439,7 +444,10 @@ static void wait_with_countdown(int seconds)
 				seconds, seconds / 60, seconds % 60);
 		else
 			printf("    waiting %ds...\n", seconds);
-		sleep(seconds);
+		while (seconds > 0 && !g_interrupted) {
+			sleep(1);
+			seconds--;
+		}
 	}
 }
 
@@ -678,7 +686,15 @@ static char *fetch_raw_transcript(const char *video_id, char **out_language)
 	struct curl_slist *headers = curl_slist_append(NULL, hdr);
 	char *body = http_fetch(url, NULL, headers, 30);
 	curl_slist_free_all(headers);
-	if (!body) return NULL;
+	if (!body) {
+		/* 404 = permanent: use API's own detail message as marker */
+		if (g_last_http_code == 404 && g_last_http_detail[0]) {
+			char marker[100];
+			snprintf(marker, sizeof(marker), "[%.95s]", g_last_http_detail);
+			return strdup(marker);
+		}
+		return NULL;
+	}
 
 	cJSON *root = cJSON_Parse(body);
 	free(body);
@@ -1606,7 +1622,8 @@ int main(int argc, char **argv)
 
 	/* Set up for batch modes */
 	srand(time(NULL));
-	signal(SIGINT, sigint_handler);
+	struct sigaction sa = { .sa_handler = sigint_handler };
+	sigaction(SIGINT, &sa, NULL);
 	Backoff bo;
 	backoff_init(&bo, opt_min_delay, opt_max_backoff, opt_initial_delay, 3, 2);
 
