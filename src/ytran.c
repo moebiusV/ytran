@@ -1418,6 +1418,7 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 			break;
 		case RESULT_PERMANENT:
 			done++;
+			backoff_success(bo);
 			break;
 		case RESULT_CREDITS:
 			printf("Out of transcriptapi.com credits. "
