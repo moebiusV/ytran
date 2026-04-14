@@ -68,9 +68,19 @@ Default: 5.
 Starting delay between requests in batch modes.
 Default: 10.
 .TP
+.B \-\-haiku
+Use claude-haiku-4-5 for formatting and summarization.
+Shorthand for
+.BR "\-\-model claude-haiku-4-5" .
+.TP
+.B \-\-sonnet
+Use claude-sonnet-4-6 for formatting and summarization (default).
+Shorthand for
+.BR "\-\-model claude-sonnet-4-6" .
+.TP
 .BI \-\-model " MODEL"
 Claude model to use for formatting and summarization.
-Default: claude-sonnet-4-5.
+Default: claude-sonnet-4-6.
 .TP
 .BR \-n ", " \-\-no\-summary
 Fetch metadata and raw transcript only; do not format or summarize

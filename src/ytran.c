@@ -45,7 +45,7 @@ typedef struct {
 
 static const struct { const char *model; double pi, pcw, pcr, po; } pricing[] = {
 	{"claude-opus-4-6",   5.0, 6.25, 0.50, 25.0},
-	{"claude-sonnet-4-5", 3.0, 3.75, 0.30, 15.0},
+	{"claude-sonnet-4-6", 3.0, 3.75, 0.30, 15.0},
 	{"claude-haiku-4-5",  1.0, 1.25, 0.10,  5.0},
 	{NULL, 5.0, 6.25, 0.50, 25.0}
 };
@@ -56,7 +56,7 @@ static double total_cost;
 static double g_last_cost;  /* cost of most recent API call */
 static char *transcript_api_key;
 static char *anthropic_api_key;
-static const char *model = "claude-sonnet-4-5";
+static const char *model = "claude-sonnet-4-6";
 
 /* ── Buffer ── */
 
@@ -1551,6 +1551,10 @@ int main(int argc, char **argv)
 			fix = true;
 		} else if (is_arg(a, "--fix-full") || is_arg(a, "-F")) {
 			fix_full = true;
+		} else if (is_arg(a, "--haiku")) {
+			model = "claude-haiku-4-5";
+		} else if (is_arg(a, "--sonnet")) {
+			model = "claude-sonnet-4-6";
 		} else if (is_arg(a, "--model") || is_arg(a, "-m")) {
 			if (++i < argc) model = argv[i];
 		} else if ((v = is_arg_val(a, "--model"))) {
@@ -1581,6 +1585,8 @@ int main(int argc, char **argv)
 			       "  --browse            Browse the transcript database\n"
 			       "  --fix               Fill in missing fields (with backoff)\n"
 			       "  --fix-full [VID ...] Like --fix, but includes raw-only videos\n"
+			       "  --haiku             Use claude-haiku-4-5\n"
+			       "  --sonnet            Use claude-sonnet-4-6\n"
 			       "  --model MODEL       Claude model [%s]\n"
 			       "  --no-summary        Fetch metadata and transcript only\n"
 			       "  --skip IDs          Comma-separated video IDs to skip\n"
