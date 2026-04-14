@@ -25,7 +25,10 @@ typedef struct {
 	size_t cap;
 } Buf;
 
-enum { RESULT_OK = 0, RESULT_TRANSIENT = 1, RESULT_PERMANENT = 2, RESULT_CREDITS = 3 };
+enum { RESULT_OK = 0, RESULT_TRANSIENT = 1, RESULT_PERMANENT = 2, RESULT_CREDITS = 3,
+       RESULT_TIMEOUT = 4 };
+
+#define TIMEOUT_BACKOFF_CAP 15
 
 typedef struct {
 	char **ids;
@@ -1374,6 +1377,8 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	int result = RESULT_OK;
 	if (g_last_http_code == 402)
 		result = RESULT_CREDITS;
+	else if (g_last_http_code == 408)
+		result = RESULT_TIMEOUT;
 	else if (!raw_transcript || !*raw_transcript)
 		result = RESULT_TRANSIENT;
 	else if (raw_transcript[0] == '[')
@@ -1401,6 +1406,7 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 
 	int total = queue->count;
 	int done = 0;
+	double tmo_delay = bo->min_delay;
 
 	while (queue->count > 0 && !g_interrupted) {
 		char *vid = queue_pop(queue);
@@ -1415,10 +1421,14 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 		case RESULT_OK:
 			done++;
 			backoff_success(bo);
+			tmo_delay *= 0.99;
+			if (tmo_delay < bo->min_delay) tmo_delay = bo->min_delay;
 			break;
 		case RESULT_PERMANENT:
 			done++;
 			backoff_success(bo);
+			tmo_delay *= 0.99;
+			if (tmo_delay < bo->min_delay) tmo_delay = bo->min_delay;
 			break;
 		case RESULT_CREDITS:
 			printf("Out of transcriptapi.com credits. "
@@ -1426,6 +1436,14 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 			/* Don't mark remaining as failed — leave for retry after top-up */
 			free(vid);
 			goto batch_done;
+		case RESULT_TIMEOUT:
+			queue_push(queue, vid);
+			printf("  timed out — re-queued (%d remaining)\n",
+				queue->count);
+			tmo_delay *= 1.5;
+			if (tmo_delay > TIMEOUT_BACKOFF_CAP)
+				tmo_delay = TIMEOUT_BACKOFF_CAP;
+			break;
 		case RESULT_TRANSIENT:
 			queue_push(queue, vid);
 			printf("  failed — re-queued (%d remaining)\n", queue->count);
@@ -1459,7 +1477,11 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 		free(vid);
 
 		if (queue->count > 0 && !g_interrupted) {
-			int delay = backoff_jittered_delay(bo);
+			int delay;
+			if (result == RESULT_TIMEOUT)
+				delay = (int)(tmo_delay + 0.5);
+			else
+				delay = backoff_jittered_delay(bo);
 			wait_with_countdown(delay);
 		}
 	}
