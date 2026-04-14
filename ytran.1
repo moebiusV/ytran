@@ -44,6 +44,15 @@ are skipped unless
 .B \-\-force
 is also given.
 .TP
+.B \-\-fix\-all
+Process the given video URLs or IDs with full summarization,
+regardless of whether they already exist in the database.
+This is intended for promoting raw\-only entries (e.g.\& videos
+downloaded via a channel) to full entries with formatted
+transcripts and summaries.
+The raw\-only flag is cleared.
+Multiple videos use batch mode with backoff.
+.TP
 .B \-\-force
 When combined with
 .BR \-\-fix ,

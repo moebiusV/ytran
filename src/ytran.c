@@ -1514,7 +1514,8 @@ static const char *is_arg_val(const char *a, const char *opt)
 
 int main(int argc, char **argv)
 {
-	bool browse = false, fix = false, no_summary = false, force = false;
+	bool browse = false, fix = false, fix_all = false;
+	bool no_summary = false, force = false;
 	const char *skip_str = NULL;
 	int opt_max_backoff = 1800, opt_min_delay = 5, opt_initial_delay = 10;
 	char **urls = NULL;
@@ -1526,6 +1527,8 @@ int main(int argc, char **argv)
 			browse = true;
 		} else if (is_arg(a, "--fix") || is_arg(a, "-f")) {
 			fix = true;
+		} else if (is_arg(a, "--fix-all") || is_arg(a, "-F")) {
+			fix_all = true;
 		} else if (is_arg(a, "--model") || is_arg(a, "-m")) {
 			if (++i < argc) model = argv[i];
 		} else if ((v = is_arg_val(a, "--model"))) {
@@ -1557,6 +1560,7 @@ int main(int argc, char **argv)
 			printf("Usage: ytran [OPTIONS] [URL_OR_ID_OR_CHANNEL ...]\n"
 			       "  --browse            Browse the transcript database\n"
 			       "  --fix               Fill in missing fields (with backoff)\n"
+			       "  --fix-all VID ...   Summarize specific raw-only videos\n"
 			       "  --force             With --fix, include raw-only entries\n"
 			       "  --model MODEL       Claude model [%s]\n"
 			       "  --no-summary        Fetch metadata and transcript only\n"
@@ -1741,7 +1745,30 @@ int main(int argc, char **argv)
 		free(ch_fixes);
 	}
 
-	if (!fix && nurls > 0) {
+	if (fix_all && nurls > 0) {
+		/* Process specific videos with full summarization */
+		VideoQueue faq;
+		queue_init(&faq);
+		for (int i = 0; i < nurls; i++) {
+			char *video_id = extract_youtube_id(urls[i]);
+			if (video_id) {
+				queue_push(&faq, video_id);
+				free(video_id);
+			}
+		}
+		if (faq.count == 1) {
+			char *vid = queue_pop(&faq);
+			process_video(vid, db, false);
+			free(vid);
+		} else if (faq.count > 1) {
+			backoff_init(&bo, opt_min_delay, opt_max_backoff,
+				opt_initial_delay, 3, 2);
+			run_batch(&faq, db, &bo, false, "fix-all");
+		}
+		queue_free(&faq);
+	}
+
+	if (!fix && !fix_all && nurls > 0) {
 		/* Separate channel URLs from video URLs */
 		char **chan_urls = NULL;
 		int nchans = 0;
