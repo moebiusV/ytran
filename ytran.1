@@ -1,15 +1,29 @@
-.TH YTRAN 1 "2026-03-08" "ytran 1.0" "User Commands"
+.TH YTRAN 1 "2026-04-14" "ytran 1.1" "User Commands"
 .SH NAME
 ytran \- fetch and summarize YouTube video transcripts
 .SH SYNOPSIS
 .B ytran
 .RI [ OPTIONS ]
 .RI [ VIDEO_URL_OR_ID " ..." ]
+.br
+.B ytran
+.RI [ OPTIONS ]
+.RI CHANNEL_URL
 .SH DESCRIPTION
 .B ytran
 fetches YouTube video transcripts via transcriptapi.com, formats them
 with Claude, generates summaries, and stores everything in a local
 SQLite database.
+.PP
+When given a channel URL (containing \fB/@\fR, \fB/channel/\fR, \fB/c/\fR,
+or \fB/user/\fR), the tool expands the full video list via
+.BR yt\-dlp ,
+skips already-downloaded videos, and processes the remainder with
+automatic retry and exponential backoff.
+.PP
+Multiple video URLs are also processed in batch mode with backoff.
+Failed downloads are re-queued at the back of the list (circular queue)
+and retried until 4 consecutive failures at the backoff ceiling.
 .SH OPTIONS
 .TP
 .BR \-b ", " \-\-browse
@@ -23,6 +37,7 @@ Options and URLs may be intermixed in any order.
 .B \-\-fix
 Scan all database entries and fill in any missing fields (metadata,
 transcripts, summaries).
+Uses circular retry queue with backoff for transient failures.
 Entries saved with
 .B \-\-no\-summary
 are skipped unless
@@ -35,6 +50,18 @@ When combined with
 also process entries that were saved with
 .BR \-\-no\-summary .
 The raw\-only flag is cleared and summaries are generated.
+.TP
+.BI \-\-max\-backoff " SECS"
+Backoff ceiling in seconds for batch/fix/channel modes.
+Default: 1800 (30 minutes).
+.TP
+.BI \-\-min\-delay " SECS"
+Minimum delay between requests in batch modes.
+Default: 5.
+.TP
+.BI \-\-initial\-delay " SECS"
+Starting delay between requests in batch modes.
+Default: 10.
 .TP
 .BI \-\-model " MODEL"
 Claude model to use for formatting and summarization.
@@ -53,6 +80,38 @@ Comma-separated list of video IDs to skip during \-\-fix operations.
 .TP
 .B \-\-version
 Print version and exit.
+.SH BATCH MODES
+.PP
+Three modes use the circular retry queue with AIMD
+(additive decrease, multiplicative increase) backoff:
+.TP
+.B \-\-fix
+Re-queues transient failures; marks permanent failures in the database.
+Resumes from last position on restart via the
+.I queue_state
+table.
+.TP
+.B Channel URLs
+Expands channel playlists via
+.BR yt\-dlp (1),
+filters already-downloaded videos, then processes the remainder.
+Transcripts are fetched in
+.B \-\-no\-summary
+mode.
+.TP
+.B Multiple video URLs
+Two or more video URLs on the command line trigger batch processing
+with backoff.
+.PP
+On success, the delay decreases by 2 seconds (floor:
+.BR \-\-min\-delay ).
+On failure, the delay triples (ceiling:
+.BR \-\-max\-backoff ).
+After 4 consecutive failures at the ceiling, the tool gives up and
+marks remaining videos with the last error detail.
+.PP
+Ctrl-C during batch processing saves the cursor position so the
+next run resumes where it left off.
 .SH FILES
 .TP
 .I ~/.local/share/ytran/youtube-transcripts.db
@@ -64,15 +123,8 @@ transcriptapi.com bearer token.
 .I ~/.anthropic_api_key
 Anthropic API key for Claude.
 .SH SEE ALSO
-.BR ytchan (1)
-\(em download transcripts for an entire YouTube channel.
-Passes
-.B \-\-no\-summary
-by default; accepts additional
-.B ytran
-options before the channel URL.
-Requires
-.BR yt\-dlp .
+.BR yt\-dlp (1)
+\(em used for expanding channel URLs to video lists.
 .SH AUTHOR
 David Walther <david@clearbrookdistillery.com>
 .SH LICENSE

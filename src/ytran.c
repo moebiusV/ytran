@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/stat.h>
 #include <curl/curl.h>
 #include <sqlite3.h>
@@ -23,6 +24,19 @@ typedef struct {
 	size_t len;
 	size_t cap;
 } Buf;
+
+enum { RESULT_OK = 0, RESULT_TRANSIENT = 1, RESULT_PERMANENT = 2, RESULT_CREDITS = 3 };
+
+typedef struct {
+	char **ids;
+	int count, cap;
+} VideoQueue;
+
+typedef struct {
+	int delay, ceiling_fails;
+	int min_delay, max_delay, initial_delay;
+	int backoff_mult, decrease;
+} Backoff;
 
 /* ── Pricing ($/MTok): input, cache_write, cache_read, output ── */
 
@@ -179,7 +193,12 @@ static char *xdg_data_home(void)
 
 /* ── Fix-mode state ── */
 static bool g_fix_mode = false;
-static char g_last_http_error[64];  /* empty if OK, else error description */
+static char g_last_http_error[64];   /* empty if OK, else error description */
+static long g_last_http_code = 0;    /* HTTP status from last request */
+static char g_last_http_detail[256]; /* full error: "HTTP 429: Too Many Requests" */
+static volatile sig_atomic_t g_interrupted = 0;
+
+static void sigint_handler(int sig) { (void)sig; g_interrupted = 1; }
 
 /* ── HTTP ── */
 
@@ -212,8 +231,12 @@ static char *http_fetch(const char *url, const char *post_body,
 	long code = 0;
 	curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &code);
 	curl_easy_cleanup(c);
+	g_last_http_code = code;
+	g_last_http_detail[0] = '\0';
 
 	if (res != CURLE_OK) {
+		snprintf(g_last_http_detail, sizeof(g_last_http_detail),
+			"curl: %s", curl_easy_strerror(res));
 		if (g_fix_mode)
 			snprintf(g_last_http_error, sizeof(g_last_http_error),
 				"%s", curl_easy_strerror(res));
@@ -223,31 +246,42 @@ static char *http_fetch(const char *url, const char *post_body,
 		return NULL;
 	}
 	if (code >= 400) {
+		/* Try to extract JSON error message for detail capture */
+		const char *errmsg = NULL;
+		if (resp.data) {
+			cJSON *err = cJSON_Parse(resp.data);
+			if (err) {
+				cJSON *eo = cJSON_GetObjectItem(err, "error");
+				if (eo) {
+					cJSON *msg = cJSON_GetObjectItem(eo, "message");
+					if (cJSON_IsString(msg))
+						errmsg = msg->valuestring;
+				}
+				/* some APIs put message at top level */
+				if (!errmsg) {
+					cJSON *msg = cJSON_GetObjectItem(err, "message");
+					if (cJSON_IsString(msg))
+						errmsg = msg->valuestring;
+				}
+				snprintf(g_last_http_detail, sizeof(g_last_http_detail),
+					"HTTP %ld: %s", code, errmsg ? errmsg : "");
+				cJSON_Delete(err);
+			} else {
+				snprintf(g_last_http_detail, sizeof(g_last_http_detail),
+					"HTTP %ld", code);
+			}
+		} else {
+			snprintf(g_last_http_detail, sizeof(g_last_http_detail),
+				"HTTP %ld", code);
+		}
 		if (g_fix_mode) {
 			snprintf(g_last_http_error, sizeof(g_last_http_error),
 				"HTTP %ld", code);
 		} else {
-			fprintf(stderr, "HTTP %ld: ", code);
-			/* Try to extract JSON error message */
-			bool printed = false;
-			if (resp.data) {
-				cJSON *err = cJSON_Parse(resp.data);
-				if (err) {
-					cJSON *eo = cJSON_GetObjectItem(err, "error");
-					if (eo) {
-						cJSON *msg = cJSON_GetObjectItem(eo, "message");
-						if (cJSON_IsString(msg)) {
-							fprintf(stderr, "%s\n", msg->valuestring);
-							printed = true;
-						}
-					}
-					cJSON_Delete(err);
-				}
-				if (!printed)
-					fprintf(stderr, "%s\n", url);
-			} else {
-				fprintf(stderr, "%s\n", url);
-			}
+			if (errmsg)
+				fprintf(stderr, "HTTP %ld: %s\n", code, errmsg);
+			else
+				fprintf(stderr, "HTTP %ld: %s\n", code, url);
 		}
 		buf_free(&resp);
 		return NULL;
@@ -257,8 +291,15 @@ static char *http_fetch(const char *url, const char *post_body,
 
 /* ── YouTube ID extraction ── */
 
+static bool is_channel_url(const char *url)
+{
+	return strstr(url, "/@") || strstr(url, "/channel/") ||
+	       strstr(url, "/c/") || strstr(url, "/user/");
+}
+
 static char *extract_youtube_id(const char *s)
 {
+	if (is_channel_url(s)) return NULL;
 	/* ?v=XXXXXXXXXXX */
 	const char *p = strstr(s, "v=");
 	if (p) {
@@ -287,6 +328,229 @@ static char *extract_youtube_id(const char *s)
 bad:
 	fprintf(stderr, "Invalid YouTube URL or ID: %s\n", s);
 	return NULL;
+}
+
+/* ── Video queue (circular FIFO) ── */
+
+static void queue_init(VideoQueue *q) { memset(q, 0, sizeof(*q)); }
+
+static void queue_push(VideoQueue *q, const char *id)
+{
+	if (q->count >= q->cap) {
+		q->cap = q->cap ? q->cap * 2 : 64;
+		q->ids = realloc(q->ids, q->cap * sizeof(char *));
+	}
+	q->ids[q->count++] = strdup(id);
+}
+
+static char *queue_pop(VideoQueue *q)
+{
+	if (q->count == 0) return NULL;
+	char *id = q->ids[0];
+	memmove(q->ids, q->ids + 1, (q->count - 1) * sizeof(char *));
+	q->count--;
+	return id;
+}
+
+static void queue_free(VideoQueue *q)
+{
+	for (int i = 0; i < q->count; i++) free(q->ids[i]);
+	free(q->ids);
+	memset(q, 0, sizeof(*q));
+}
+
+static void queue_rotate_to(VideoQueue *q, const char *after_id)
+{
+	for (int j = 0; j < q->count; j++) {
+		if (strcmp(q->ids[j], after_id) == 0) {
+			/* rotate so after_id is at the back */
+			int new_front = j + 1;
+			if (new_front >= q->count) return; /* already at end */
+			char **tmp = malloc(q->count * sizeof(char *));
+			int n = q->count - new_front;
+			memcpy(tmp, q->ids + new_front, n * sizeof(char *));
+			memcpy(tmp + n, q->ids, new_front * sizeof(char *));
+			free(q->ids);
+			q->ids = tmp;
+			q->cap = q->count;
+			return;
+		}
+	}
+}
+
+/* ── Backoff (AIMD) ── */
+
+static void backoff_init(Backoff *b, int min_d, int max_d, int init_d,
+                         int mult, int decr)
+{
+	b->delay = init_d;
+	b->ceiling_fails = 0;
+	b->min_delay = min_d;
+	b->max_delay = max_d;
+	b->initial_delay = init_d;
+	b->backoff_mult = mult;
+	b->decrease = decr;
+}
+
+static void backoff_success(Backoff *b)
+{
+	b->ceiling_fails = 0;
+	b->delay -= b->decrease;
+	if (b->delay < b->min_delay) b->delay = b->min_delay;
+}
+
+static void backoff_failure(Backoff *b)
+{
+	b->delay *= b->backoff_mult;
+	if (b->delay >= b->max_delay) {
+		b->delay = b->max_delay;
+		b->ceiling_fails++;
+	} else {
+		b->ceiling_fails = 0;
+	}
+}
+
+static bool backoff_should_give_up(Backoff *b) { return b->ceiling_fails >= 4; }
+
+static int backoff_jittered_delay(Backoff *b)
+{
+	int range = b->delay * 2 / 5; /* 40% of delay = ±20% */
+	int jitter = range > 0 ? (rand() % (range + 1)) - range / 2 : 0;
+	int actual = b->delay + jitter;
+	if (actual < b->min_delay) actual = b->min_delay;
+	return actual;
+}
+
+/* ── TTY-aware countdown ── */
+
+static void wait_with_countdown(int seconds)
+{
+	if (isatty(STDOUT_FILENO)) {
+		for (int left = seconds; left > 0; left--) {
+			printf("\r    waiting %ds ", left);
+			fflush(stdout);
+			sleep(1);
+		}
+		printf("\r                    \r");
+		fflush(stdout);
+	} else {
+		if (seconds >= 60)
+			printf("    waiting %ds (%dm%ds)...\n",
+				seconds, seconds / 60, seconds % 60);
+		else
+			printf("    waiting %ds...\n", seconds);
+		sleep(seconds);
+	}
+}
+
+/* ── Channel expansion via yt-dlp ── */
+
+static VideoQueue expand_channel(const char *channel_url)
+{
+	VideoQueue q;
+	queue_init(&q);
+	char cmd[1024];
+	snprintf(cmd, sizeof(cmd),
+		"yt-dlp --flat-playlist --print id '%s' 2>/dev/null", channel_url);
+	FILE *fp = popen(cmd, "r");
+	if (!fp) return q;
+	char line[64];
+	while (fgets(line, sizeof(line), fp)) {
+		line[strcspn(line, "\r\n")] = '\0';
+		if (line[0]) queue_push(&q, line);
+	}
+	pclose(fp);
+	return q;
+}
+
+/* ── DB helpers for batch mode ── */
+
+static void filter_already_downloaded(VideoQueue *q, sqlite3 *db)
+{
+	/* Build set of video IDs already in DB with transcripts */
+	sqlite3_stmt *st;
+	sqlite3_prepare_v2(db,
+		"SELECT video_id FROM videos "
+		"WHERE raw_transcript IS NOT NULL AND raw_transcript != ''",
+		-1, &st, NULL);
+	/* Simple linear search — adequate for typical channel sizes */
+	char **done = NULL;
+	int ndone = 0, dcap = 0;
+	while (sqlite3_step(st) == SQLITE_ROW) {
+		const char *vid = (const char *)sqlite3_column_text(st, 0);
+		if (ndone >= dcap) {
+			dcap = dcap ? dcap * 2 : 256;
+			done = realloc(done, dcap * sizeof(char *));
+		}
+		done[ndone++] = strdup(vid);
+	}
+	sqlite3_finalize(st);
+
+	/* Filter queue in place */
+	int kept = 0;
+	for (int i = 0; i < q->count; i++) {
+		bool skip = false;
+		for (int j = 0; j < ndone; j++) {
+			if (strcmp(q->ids[i], done[j]) == 0) { skip = true; break; }
+		}
+		if (skip) {
+			free(q->ids[i]);
+		} else {
+			q->ids[kept++] = q->ids[i];
+		}
+	}
+	int skipped = q->count - kept;
+	q->count = kept;
+	if (skipped > 0)
+		printf("Skipped %d already-downloaded videos\n", skipped);
+
+	for (int i = 0; i < ndone; i++) free(done[i]);
+	free(done);
+}
+
+static void queue_state_init_table(sqlite3 *db)
+{
+	sqlite3_exec(db,
+		"CREATE TABLE IF NOT EXISTS queue_state "
+		"(queue_name TEXT PRIMARY KEY, last_video_id TEXT)",
+		NULL, NULL, NULL);
+}
+
+static void queue_state_save(sqlite3 *db, const char *name, const char *vid)
+{
+	sqlite3_stmt *st;
+	sqlite3_prepare_v2(db,
+		"INSERT OR REPLACE INTO queue_state VALUES (?, ?)", -1, &st, NULL);
+	sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+	sqlite3_bind_text(st, 2, vid, -1, SQLITE_STATIC);
+	sqlite3_step(st);
+	sqlite3_finalize(st);
+}
+
+static char *queue_state_load(sqlite3 *db, const char *name)
+{
+	sqlite3_stmt *st;
+	sqlite3_prepare_v2(db,
+		"SELECT last_video_id FROM queue_state WHERE queue_name = ?",
+		-1, &st, NULL);
+	sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+	char *vid = NULL;
+	if (sqlite3_step(st) == SQLITE_ROW) {
+		const char *v = (const char *)sqlite3_column_text(st, 0);
+		if (v && *v) vid = strdup(v);
+	}
+	sqlite3_finalize(st);
+	return vid;
+}
+
+static void queue_state_clear(sqlite3 *db, const char *name)
+{
+	sqlite3_stmt *st;
+	sqlite3_prepare_v2(db,
+		"DELETE FROM queue_state WHERE queue_name = ?", -1, &st, NULL);
+	sqlite3_bind_text(st, 1, name, -1, SQLITE_STATIC);
+	sqlite3_step(st);
+	sqlite3_finalize(st);
 }
 
 /* ── Extract JSON object starting at '{' with brace matching ── */
@@ -772,6 +1036,8 @@ static void db_init(sqlite3 *db)
 
 	/* Drop vestigial transcript column */
 	sqlite3_exec(db, "ALTER TABLE videos DROP COLUMN transcript", NULL, NULL, NULL);
+
+	queue_state_init_table(db);
 }
 
 /* ── Helpers for nullable DB strings ── */
@@ -793,7 +1059,7 @@ static void fill(char **dst, char *src)
 
 /* ── process_video ── */
 
-static void process_video(const char *video_id, sqlite3 *db, bool no_summary)
+static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 {
 	char *title = NULL, *upload_date = NULL, *duration = NULL;
 	char *description = NULL, *channel_id = NULL, *language = NULL;
@@ -1091,10 +1357,107 @@ static void process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	sqlite3_step(st);
 	sqlite3_finalize(st);
 
+	/* Determine result for batch loop */
+	int result = RESULT_OK;
+	if (g_last_http_code == 402)
+		result = RESULT_CREDITS;
+	else if (!raw_transcript || !*raw_transcript)
+		result = RESULT_TRANSIENT;
+	else if (raw_transcript[0] == '[')
+		result = RESULT_PERMANENT;
+
 	free(title); free(upload_date); free(duration); free(description);
 	free(channel_id); free(language); free(raw_transcript);
 	free(transcript_formatted); free(summary_short); free(summary_full);
 	free(fetched_at); free(channel_name); free(channel_handle);
+	return result;
+}
+
+/* ── Batch processing with circular retry queue ── */
+
+static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
+                      bool no_summary, const char *queue_name)
+{
+	/* Resume from last run */
+	char *cursor = queue_state_load(db, queue_name);
+	if (cursor) {
+		queue_rotate_to(queue, cursor);
+		printf("Resuming after %s\n", cursor);
+		free(cursor);
+	}
+
+	int total = queue->count;
+	int done = 0;
+
+	while (queue->count > 0 && !g_interrupted) {
+		char *vid = queue_pop(queue);
+		printf("[%d done, %d remaining of %d] %s\n",
+			done, queue->count + 1, total, vid);
+		fflush(stdout);
+
+		queue_state_save(db, queue_name, vid);
+		int result = process_video(vid, db, no_summary);
+
+		switch (result) {
+		case RESULT_OK:
+			done++;
+			backoff_success(bo);
+			break;
+		case RESULT_PERMANENT:
+			done++;
+			break;
+		case RESULT_CREDITS:
+			printf("Out of transcriptapi.com credits. "
+				"Top up at https://transcriptapi.com to continue.\n");
+			/* Don't mark remaining as failed — leave for retry after top-up */
+			free(vid);
+			goto batch_done;
+		case RESULT_TRANSIENT:
+			queue_push(queue, vid);
+			printf("  failed — re-queued (%d remaining)\n", queue->count);
+			backoff_failure(bo);
+			if (backoff_should_give_up(bo)) {
+				printf("Giving up: 4 failures at max backoff\n");
+				/* Mark remaining with error detail */
+				for (int i = 0; i < queue->count; i++) {
+					char marker[100];
+					if (g_last_http_detail[0])
+						snprintf(marker, sizeof(marker), "[%.95s]",
+							g_last_http_detail);
+					else
+						snprintf(marker, sizeof(marker),
+							"[download failed]");
+					sqlite3_stmt *st;
+					sqlite3_prepare_v2(db,
+						"UPDATE videos SET raw_transcript = ? "
+						"WHERE video_id = ?", -1, &st, NULL);
+					sqlite3_bind_text(st, 1, marker, -1, SQLITE_STATIC);
+					sqlite3_bind_text(st, 2, queue->ids[i], -1,
+						SQLITE_STATIC);
+					sqlite3_step(st);
+					sqlite3_finalize(st);
+				}
+				free(vid);
+				goto batch_done;
+			}
+			break;
+		}
+		free(vid);
+
+		if (queue->count > 0 && !g_interrupted) {
+			int delay = backoff_jittered_delay(bo);
+			wait_with_countdown(delay);
+		}
+	}
+
+batch_done:
+	if (g_interrupted)
+		printf("\nInterrupted — will resume from saved position\n");
+	else
+		queue_state_clear(db, queue_name);
+
+	int gave_up = queue->count;
+	printf("Done: %d processed, %d gave up\n", done, gave_up);
 }
 
 /* ── main ── */
@@ -1117,6 +1480,7 @@ int main(int argc, char **argv)
 {
 	bool browse = false, fix = false, no_summary = false, force = false;
 	const char *skip_str = NULL;
+	int opt_max_backoff = 1800, opt_min_delay = 5, opt_initial_delay = 10;
 	char **urls = NULL;
 	int nurls = 0;
 
@@ -1138,18 +1502,35 @@ int main(int argc, char **argv)
 			no_summary = true;
 		} else if (is_arg(a, "--force")) {
 			force = true;
+		} else if (is_arg(a, "--max-backoff")) {
+			if (++i < argc) opt_max_backoff = atoi(argv[i]);
+		} else if ((v = is_arg_val(a, "--max-backoff"))) {
+			opt_max_backoff = atoi(v);
+		} else if (is_arg(a, "--min-delay")) {
+			if (++i < argc) opt_min_delay = atoi(argv[i]);
+		} else if ((v = is_arg_val(a, "--min-delay"))) {
+			opt_min_delay = atoi(v);
+		} else if (is_arg(a, "--initial-delay")) {
+			if (++i < argc) opt_initial_delay = atoi(argv[i]);
+		} else if ((v = is_arg_val(a, "--initial-delay"))) {
+			opt_initial_delay = atoi(v);
 		} else if (is_arg(a, "--version") || is_arg(a, "-V")) {
-			printf("ytran 1.0\n");
+			printf("ytran 1.1\n");
 			return 0;
 		} else if (is_arg(a, "--help") || is_arg(a, "-h")) {
-			printf("Usage: ytran [OPTIONS] [VIDEO_URL_OR_ID ...]\n"
-			       "  --browse        Browse the transcript database\n"
-			       "  --fix           Fill in missing fields\n"
-			       "  --force         With --fix, include raw-only entries\n"
-			       "  --model MODEL   Claude model [%s]\n"
-			       "  --no-summary    Fetch metadata and transcript only\n"
-			       "  --skip IDs      Comma-separated video IDs to skip\n"
-			       "  --version       Show version\n", model);
+			printf("Usage: ytran [OPTIONS] [URL_OR_ID_OR_CHANNEL ...]\n"
+			       "  --browse            Browse the transcript database\n"
+			       "  --fix               Fill in missing fields (with backoff)\n"
+			       "  --force             With --fix, include raw-only entries\n"
+			       "  --model MODEL       Claude model [%s]\n"
+			       "  --no-summary        Fetch metadata and transcript only\n"
+			       "  --skip IDs          Comma-separated video IDs to skip\n"
+			       "  --max-backoff SECS  Backoff ceiling for batch modes [1800]\n"
+			       "  --min-delay SECS    Minimum inter-request delay [5]\n"
+			       "  --initial-delay SECS Starting delay [10]\n"
+			       "  --version           Show version\n"
+			       "\nChannel URLs (@handle, /channel/, /c/, /user/) auto-expand.\n",
+			       model);
 			return 0;
 		} else if (a[0] == '-') {
 			fprintf(stderr, "Unknown option: %s\n", a);
@@ -1223,13 +1604,19 @@ int main(int argc, char **argv)
 		free(tmp);
 	}
 
+	/* Set up for batch modes */
+	srand(time(NULL));
+	signal(SIGINT, sigint_handler);
+	Backoff bo;
+	backoff_init(&bo, opt_min_delay, opt_max_backoff, opt_initial_delay, 3, 2);
+
 	if (fix) {
 		g_fix_mode = true;
-		/* Collect all IDs first to avoid modifying table while iterating */
+		/* Build queue from videos with missing fields */
 		sqlite3_stmt *st;
 		char fix_sql[1024];
 		snprintf(fix_sql, sizeof(fix_sql),
-			"SELECT video_id, title FROM videos WHERE "
+			"SELECT video_id FROM videos WHERE "
 			"(title = '' OR upload_date = '' OR duration = '' OR description = '' OR "
 			"channel_id = '' OR language = '' OR raw_transcript = '' OR "
 			"transcript_formatted = '' OR summary_short = '' OR summary_full = '' OR "
@@ -1240,32 +1627,25 @@ int main(int argc, char **argv)
 			"%s",
 			force ? "" : " AND (raw_only IS NULL OR raw_only = 0)");
 		sqlite3_prepare_v2(db, fix_sql, -1, &st, NULL);
-		typedef struct { char *id; char *title; } FixEntry;
-		FixEntry *fix_entries = NULL;
-		int nfix = 0;
+		VideoQueue fixq;
+		queue_init(&fixq);
 		while (sqlite3_step(st) == SQLITE_ROW) {
 			const char *vid = (const char *)sqlite3_column_text(st, 0);
 			bool skip = false;
 			for (int i = 0; i < nskip; i++)
 				if (strcmp(vid, skip_ids[i]) == 0) { skip = true; break; }
-			if (!skip) {
-				fix_entries = realloc(fix_entries, (nfix + 1) * sizeof(FixEntry));
-				fix_entries[nfix].id = strdup(vid);
-				const char *t = (const char *)sqlite3_column_text(st, 1);
-				fix_entries[nfix].title = (t && *t) ? strdup(t) : NULL;
-				nfix++;
-			}
+			if (!skip)
+				queue_push(&fixq, vid);
 		}
 		sqlite3_finalize(st);
-		for (int i = 0; i < nfix; i++) {
-			printf("%s %s", fix_entries[i].id,
-				fix_entries[i].title ? fix_entries[i].title : "");
-			fflush(stdout);
-			process_video(fix_entries[i].id, db, false);
-			free(fix_entries[i].id);
-			free(fix_entries[i].title);
+
+		if (fixq.count > 0) {
+			printf("Found %d videos to fix\n", fixq.count);
+			run_batch(&fixq, db, &bo, false, "fix");
+		} else {
+			printf("Nothing to fix\n");
 		}
-		free(fix_entries);
+		queue_free(&fixq);
 
 		/* Populate channel_names for channels missing entries */
 		typedef struct { char *ch_id; char *vid; } ChFix;
@@ -1322,33 +1702,85 @@ int main(int argc, char **argv)
 			free(ch_fixes[i].vid);
 		}
 		free(ch_fixes);
-		printf("Fix complete\n");
 	}
 
 	if (!fix && nurls > 0) {
-		for (int vi = 0; vi < nurls; vi++) {
-			char *video_id = extract_youtube_id(urls[vi]);
-			if (!video_id) continue;
-
-			/* Check if already exists */
-			sqlite3_stmt *st;
-			sqlite3_prepare_v2(db,
-				"SELECT raw_transcript FROM videos WHERE video_id = ?", -1, &st, NULL);
-			sqlite3_bind_text(st, 1, video_id, -1, SQLITE_STATIC);
-			bool exists = false;
-			if (sqlite3_step(st) == SQLITE_ROW) {
-				const char *rt = (const char *)sqlite3_column_text(st, 0);
-				if (rt && *rt) exists = true;
-			}
-			sqlite3_finalize(st);
-
-			if (exists) {
-				printf("Transcript already downloaded for %s. Skipping.\n", video_id);
+		/* Separate channel URLs from video URLs */
+		char **chan_urls = NULL;
+		int nchans = 0;
+		char **vid_urls = NULL;
+		int nvids = 0;
+		for (int i = 0; i < nurls; i++) {
+			if (is_channel_url(urls[i])) {
+				chan_urls = realloc(chan_urls, (nchans + 1) * sizeof(char *));
+				chan_urls[nchans++] = urls[i];
 			} else {
-				process_video(video_id, db, no_summary);
+				vid_urls = realloc(vid_urls, (nvids + 1) * sizeof(char *));
+				vid_urls[nvids++] = urls[i];
 			}
-			free(video_id);
 		}
+
+		/* Process channel URLs */
+		for (int ci = 0; ci < nchans; ci++) {
+			printf("Fetching video list from: %s\n", chan_urls[ci]);
+			VideoQueue chanq = expand_channel(chan_urls[ci]);
+			printf("Found %d videos\n", chanq.count);
+			filter_already_downloaded(&chanq, db);
+			if (chanq.count > 0) {
+				printf("%d videos to process\n", chanq.count);
+				backoff_init(&bo, opt_min_delay, opt_max_backoff,
+					opt_initial_delay, 3, 2);
+				run_batch(&chanq, db, &bo, true, "channel");
+			} else {
+				printf("All videos already downloaded\n");
+			}
+			queue_free(&chanq);
+		}
+		free(chan_urls);
+
+		/* Process video URLs */
+		if (nvids == 1) {
+			/* Single video — direct processing, no queue */
+			char *video_id = extract_youtube_id(vid_urls[0]);
+			if (video_id) {
+				sqlite3_stmt *st;
+				sqlite3_prepare_v2(db,
+					"SELECT raw_transcript FROM videos WHERE video_id = ?",
+					-1, &st, NULL);
+				sqlite3_bind_text(st, 1, video_id, -1, SQLITE_STATIC);
+				bool exists = false;
+				if (sqlite3_step(st) == SQLITE_ROW) {
+					const char *rt = (const char *)sqlite3_column_text(st, 0);
+					if (rt && *rt) exists = true;
+				}
+				sqlite3_finalize(st);
+				if (exists)
+					printf("Transcript already downloaded for %s. Skipping.\n",
+						video_id);
+				else
+					process_video(video_id, db, no_summary);
+				free(video_id);
+			}
+		} else if (nvids > 1) {
+			/* Multiple videos — batch mode with backoff */
+			VideoQueue vidq;
+			queue_init(&vidq);
+			for (int i = 0; i < nvids; i++) {
+				char *video_id = extract_youtube_id(vid_urls[i]);
+				if (video_id) {
+					queue_push(&vidq, video_id);
+					free(video_id);
+				}
+			}
+			filter_already_downloaded(&vidq, db);
+			if (vidq.count > 0) {
+				backoff_init(&bo, opt_min_delay, opt_max_backoff,
+					opt_initial_delay, 3, 2);
+				run_batch(&vidq, db, &bo, no_summary, "batch");
+			}
+			queue_free(&vidq);
+		}
+		free(vid_urls);
 	}
 
 	sqlite3_close(db);

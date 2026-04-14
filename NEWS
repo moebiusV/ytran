@@ -1,5 +1,19 @@
 ytran NEWS
 
+2026-04-14  Version 1.1
+
+  * Channel URL support: auto-detect @handle, /channel/, /c/, /user/
+    URLs and expand via yt-dlp.
+  * Batch mode with circular retry queue and AIMD backoff for channels,
+    --fix, and multiple video URLs.
+  * TTY-aware countdown timer between retried requests.
+  * Resume-on-restart: batch progress saved to queue_state table;
+    Ctrl-C saves position cleanly via SIGINT handler.
+  * Credit exhaustion detection (HTTP 402) with actionable message.
+  * Descriptive error markers stored in DB for failed downloads.
+  * New flags: --max-backoff, --min-delay, --initial-delay.
+  * Removed ytchan and ytfix helper scripts (folded into ytran).
+
 2026-03-08  Version 1.0
 
   * Initial release.
