@@ -283,10 +283,7 @@ static char *http_fetch(const char *url, const char *post_body,
 			snprintf(g_last_http_error, sizeof(g_last_http_error),
 				"HTTP %ld", code);
 		} else {
-			if (errmsg)
-				fprintf(stderr, "HTTP %ld: %s\n", code, errmsg);
-			else
-				fprintf(stderr, "HTTP %ld: %s\n", code, url);
+			fprintf(stderr, "%s\n", g_last_http_detail);
 		}
 		buf_free(&resp);
 		return NULL;
