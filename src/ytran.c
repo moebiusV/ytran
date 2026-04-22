@@ -29,9 +29,11 @@ enum { RESULT_OK = 0, RESULT_TRANSIENT = 1, RESULT_PERMANENT = 2, RESULT_CREDITS
        RESULT_TIMEOUT = 4 };
 
 #define TIMEOUT_BACKOFF_CAP 15
+#define TIMEOUT_GIVE_UP_AFTER 4
 
 typedef struct {
 	char **ids;
+	int *timeouts;   /* parallel: consecutive timeouts for each id */
 	int count, cap;
 } VideoQueue;
 
@@ -339,20 +341,27 @@ bad:
 
 static void queue_init(VideoQueue *q) { memset(q, 0, sizeof(*q)); }
 
-static void queue_push(VideoQueue *q, const char *id)
+static void queue_push_n(VideoQueue *q, const char *id, int timeouts)
 {
 	if (q->count >= q->cap) {
 		q->cap = q->cap ? q->cap * 2 : 64;
 		q->ids = realloc(q->ids, q->cap * sizeof(char *));
+		q->timeouts = realloc(q->timeouts, q->cap * sizeof(int));
 	}
-	q->ids[q->count++] = strdup(id);
+	q->ids[q->count] = strdup(id);
+	q->timeouts[q->count] = timeouts;
+	q->count++;
 }
 
-static char *queue_pop(VideoQueue *q)
+static void queue_push(VideoQueue *q, const char *id) { queue_push_n(q, id, 0); }
+
+static char *queue_pop(VideoQueue *q, int *timeouts_out)
 {
 	if (q->count == 0) return NULL;
 	char *id = q->ids[0];
+	if (timeouts_out) *timeouts_out = q->timeouts[0];
 	memmove(q->ids, q->ids + 1, (q->count - 1) * sizeof(char *));
+	memmove(q->timeouts, q->timeouts + 1, (q->count - 1) * sizeof(int));
 	q->count--;
 	return id;
 }
@@ -361,6 +370,7 @@ static void queue_free(VideoQueue *q)
 {
 	for (int i = 0; i < q->count; i++) free(q->ids[i]);
 	free(q->ids);
+	free(q->timeouts);
 	memset(q, 0, sizeof(*q));
 }
 
@@ -371,12 +381,17 @@ static void queue_rotate_to(VideoQueue *q, const char *after_id)
 			/* rotate so after_id is at the back */
 			int new_front = j + 1;
 			if (new_front >= q->count) return; /* already at end */
-			char **tmp = malloc(q->count * sizeof(char *));
+			char **tmp_ids = malloc(q->count * sizeof(char *));
+			int *tmp_tmo = malloc(q->count * sizeof(int));
 			int n = q->count - new_front;
-			memcpy(tmp, q->ids + new_front, n * sizeof(char *));
-			memcpy(tmp + n, q->ids, new_front * sizeof(char *));
+			memcpy(tmp_ids, q->ids + new_front, n * sizeof(char *));
+			memcpy(tmp_ids + n, q->ids, new_front * sizeof(char *));
+			memcpy(tmp_tmo, q->timeouts + new_front, n * sizeof(int));
+			memcpy(tmp_tmo + n, q->timeouts, new_front * sizeof(int));
 			free(q->ids);
-			q->ids = tmp;
+			free(q->timeouts);
+			q->ids = tmp_ids;
+			q->timeouts = tmp_tmo;
 			q->cap = q->count;
 			return;
 		}
@@ -504,7 +519,9 @@ static void filter_already_downloaded(VideoQueue *q, sqlite3 *db)
 		if (skip) {
 			free(q->ids[i]);
 		} else {
-			q->ids[kept++] = q->ids[i];
+			q->ids[kept] = q->ids[i];
+			q->timeouts[kept] = q->timeouts[i];
+			kept++;
 		}
 	}
 	int skipped = q->count - kept;
@@ -1429,10 +1446,12 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 
 	int total = queue->count;
 	int done = 0;
+	int timed_out_skipped = 0;
 	double tmo_delay = bo->min_delay;
 
 	while (queue->count > 0 && !g_interrupted) {
-		char *vid = queue_pop(queue);
+		int prev_timeouts = 0;
+		char *vid = queue_pop(queue, &prev_timeouts);
 		printf("[%d done, %d remaining of %d] %s\n",
 			done, queue->count + 1, total, vid);
 		fflush(stdout);
@@ -1459,14 +1478,31 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 			/* Don't mark remaining as failed — leave for retry after top-up */
 			free(vid);
 			goto batch_done;
-		case RESULT_TIMEOUT:
-			queue_push(queue, vid);
-			printf("  timed out — re-queued (%d remaining)\n",
-				queue->count);
+		case RESULT_TIMEOUT: {
+			int new_timeouts = prev_timeouts + 1;
+			if (new_timeouts >= TIMEOUT_GIVE_UP_AFTER) {
+				timed_out_skipped++;
+				printf("  timed out %d times — giving up on this video\n",
+					new_timeouts);
+				sqlite3_stmt *st;
+				sqlite3_prepare_v2(db,
+					"UPDATE videos SET raw_transcript = ? "
+					"WHERE video_id = ?", -1, &st, NULL);
+				sqlite3_bind_text(st, 1, "[timeout]", -1, SQLITE_STATIC);
+				sqlite3_bind_text(st, 2, vid, -1, SQLITE_STATIC);
+				sqlite3_step(st);
+				sqlite3_finalize(st);
+				/* tmo_delay still bumps so we don't hammer the API */
+			} else {
+				queue_push_n(queue, vid, new_timeouts);
+				printf("  timed out (%d/%d) — re-queued (%d remaining)\n",
+					new_timeouts, TIMEOUT_GIVE_UP_AFTER, queue->count);
+			}
 			tmo_delay *= 1.5;
 			if (tmo_delay > TIMEOUT_BACKOFF_CAP)
 				tmo_delay = TIMEOUT_BACKOFF_CAP;
 			break;
+		}
 		case RESULT_TRANSIENT:
 			queue_push(queue, vid);
 			printf("  failed — re-queued (%d remaining)\n", queue->count);
@@ -1516,7 +1552,11 @@ batch_done:
 		queue_state_clear(db, queue_name);
 
 	int gave_up = queue->count;
-	printf("Done: %d processed, %d gave up\n", done, gave_up);
+	if (timed_out_skipped > 0)
+		printf("Done: %d processed, %d timed out (skipped), %d gave up\n",
+			done, timed_out_skipped, gave_up);
+	else
+		printf("Done: %d processed, %d gave up\n", done, gave_up);
 }
 
 /* ── main ── */
@@ -1782,7 +1822,7 @@ int main(int argc, char **argv)
 			}
 		}
 		if (ffq.count == 1) {
-			char *vid = queue_pop(&ffq);
+			char *vid = queue_pop(&ffq, NULL);
 			process_video(vid, db, false);
 			free(vid);
 		} else if (ffq.count > 1) {
