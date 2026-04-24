@@ -486,6 +486,18 @@ static VideoQueue expand_channel(const char *channel_url)
 	return q;
 }
 
+static void mark_channel_bulkdl(sqlite3 *db, const char *channel_id)
+{
+	sqlite3_stmt *st;
+	if (sqlite3_prepare_v2(db,
+		"INSERT INTO channels (channel_id, bulkdl) VALUES (?, 1) "
+		"ON CONFLICT(channel_id) DO UPDATE SET bulkdl = 1",
+		-1, &st, NULL) != SQLITE_OK) return;
+	sqlite3_bind_text(st, 1, channel_id, -1, SQLITE_STATIC);
+	sqlite3_step(st);
+	sqlite3_finalize(st);
+}
+
 /* ── DB helpers for batch mode ── */
 
 static void filter_already_downloaded(VideoQueue *q, sqlite3 *db)
@@ -1054,6 +1066,21 @@ static void db_init(sqlite3 *db)
 		"CREATE TABLE IF NOT EXISTS channel_names ("
 		"channel_id TEXT, name_type TEXT, name TEXT, timestamp TEXT, "
 		"PRIMARY KEY (channel_id, name_type, timestamp))", NULL, NULL, NULL);
+
+	sqlite3_exec(db,
+		"CREATE TABLE IF NOT EXISTS channels ("
+		"channel_id TEXT PRIMARY KEY, "
+		"bulkdl INTEGER NOT NULL DEFAULT 0)", NULL, NULL, NULL);
+
+	/* Seed bulkdl heuristically: >10 videos sharing a channel_id implies a
+	 * past "download all videos" run. INSERT OR IGNORE preserves any rows
+	 * already marked explicitly. */
+	sqlite3_exec(db,
+		"INSERT OR IGNORE INTO channels (channel_id, bulkdl) "
+		"SELECT channel_id, CASE WHEN COUNT(*) > 10 THEN 1 ELSE 0 END "
+		"FROM videos "
+		"WHERE channel_id IS NOT NULL AND channel_id <> '' "
+		"GROUP BY channel_id", NULL, NULL, NULL);
 
 	/* Add missing columns */
 	const char *cols[] = {"title","upload_date","duration","description","channel_id",
@@ -1854,6 +1881,17 @@ int main(int argc, char **argv)
 			printf("Fetching video list from: %s\n", chan_urls[ci]);
 			VideoQueue chanq = expand_channel(chan_urls[ci]);
 			printf("Found %d videos\n", chanq.count);
+
+			/* Snapshot IDs so we can look up channel_id after run_batch
+			 * consumes the queue. */
+			int orig_count = chanq.count;
+			char **orig_ids = NULL;
+			if (orig_count > 0) {
+				orig_ids = malloc(orig_count * sizeof(char *));
+				for (int k = 0; k < orig_count; k++)
+					orig_ids[k] = strdup(chanq.ids[k]);
+			}
+
 			filter_already_downloaded(&chanq, db);
 			if (chanq.count > 0) {
 				printf("%d videos to process\n", chanq.count);
@@ -1863,6 +1901,36 @@ int main(int argc, char **argv)
 			} else {
 				printf("All videos already downloaded\n");
 			}
+
+			/* Mark channel as bulk-downloaded. channel_id lives on the
+			 * video rows; pick it up from the first one we can find. */
+			if (orig_count > 0) {
+				sqlite3_stmt *st;
+				sqlite3_prepare_v2(db,
+					"SELECT channel_id FROM videos "
+					"WHERE video_id = ? "
+					"AND channel_id IS NOT NULL AND channel_id <> ''",
+					-1, &st, NULL);
+				for (int k = 0; k < orig_count; k++) {
+					sqlite3_bind_text(st, 1, orig_ids[k],
+						-1, SQLITE_STATIC);
+					if (sqlite3_step(st) == SQLITE_ROW) {
+						const char *cid = (const char *)
+							sqlite3_column_text(st, 0);
+						if (cid && *cid) {
+							char *cid_copy = strdup(cid);
+							mark_channel_bulkdl(db, cid_copy);
+							free(cid_copy);
+							break;
+						}
+					}
+					sqlite3_reset(st);
+				}
+				sqlite3_finalize(st);
+				for (int k = 0; k < orig_count; k++) free(orig_ids[k]);
+				free(orig_ids);
+			}
+
 			queue_free(&chanq);
 		}
 		free(chan_urls);
