@@ -7,7 +7,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdarg.h>
 #include <stdbool.h>
 #include <time.h>
 #include <unistd.h>
@@ -77,17 +76,6 @@ static void buf_append(Buf *b, const char *s, size_t n)
 }
 
 static void buf_free(Buf *b) { free(b->data); memset(b, 0, sizeof(*b)); }
-
-__attribute__((format(printf, 2, 3)))
-static void buf_printf(Buf *b, const char *fmt, ...)
-{
-	char *s = NULL;
-	va_list ap;
-	va_start(ap, fmt);
-	int n = vasprintf(&s, fmt, ap);
-	va_end(ap);
-	if (n >= 0) { buf_append(b, s, n); free(s); }
-}
 
 /* ── String helpers ── */
 
@@ -196,8 +184,7 @@ static char *xdg_data_home(void)
 	return path;
 }
 
-/* ── Fix-mode state ── */
-static bool g_fix_mode = false;
+/* ── Per-request error state ── */
 static char g_last_http_error[64];   /* empty if OK, else error description */
 static long g_last_http_code = 0;    /* HTTP status from last request */
 static char g_last_http_detail[256]; /* full error: "HTTP 429: Too Many Requests" */
@@ -242,11 +229,8 @@ static char *http_fetch(const char *url, const char *post_body,
 	if (res != CURLE_OK) {
 		snprintf(g_last_http_detail, sizeof(g_last_http_detail),
 			"curl: %s", curl_easy_strerror(res));
-		if (g_fix_mode)
-			snprintf(g_last_http_error, sizeof(g_last_http_error),
-				"%s", curl_easy_strerror(res));
-		else
-			fprintf(stderr, "HTTP error: %s\n", curl_easy_strerror(res));
+		snprintf(g_last_http_error, sizeof(g_last_http_error),
+			"%s", curl_easy_strerror(res));
 		buf_free(&resp);
 		return NULL;
 	}
@@ -284,12 +268,8 @@ static char *http_fetch(const char *url, const char *post_body,
 			snprintf(g_last_http_detail, sizeof(g_last_http_detail),
 				"HTTP %ld", code);
 		}
-		if (g_fix_mode) {
-			snprintf(g_last_http_error, sizeof(g_last_http_error),
-				"HTTP %ld", code);
-		} else {
-			fprintf(stderr, "%s\n", g_last_http_detail);
-		}
+		snprintf(g_last_http_error, sizeof(g_last_http_error),
+			"HTTP %ld", code);
 		buf_free(&resp);
 		return NULL;
 	}
@@ -967,31 +947,21 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 	curl_slist_free_all(headers);
 
 	if (res != CURLE_OK) {
-		if (g_fix_mode)
-			snprintf(g_last_http_error, sizeof(g_last_http_error),
-				"%s", curl_easy_strerror(res));
-		else
-			fprintf(stderr, "HTTP error: %s\n", curl_easy_strerror(res));
+		snprintf(g_last_http_error, sizeof(g_last_http_error),
+			"%s", curl_easy_strerror(res));
 		stream_free(&ctx);
 		return strdup("");
 	}
 	if (code >= 400) {
-		if (g_fix_mode) {
-			snprintf(g_last_http_error, sizeof(g_last_http_error),
-				"HTTP %ld", code);
-		} else {
-			fprintf(stderr, "HTTP %ld", code);
-			if (ctx.errmsg[0])
-				fprintf(stderr, ": %s\n", ctx.errmsg);
-			else
-				fprintf(stderr, "\n");
-		}
+		snprintf(g_last_http_error, sizeof(g_last_http_error),
+			"HTTP %ld", code);
 		stream_free(&ctx);
 		return strdup("");
 	}
 
-	if (ctx.error && !g_fix_mode)
-		fprintf(stderr, "Stream error: %s\n", ctx.errmsg);
+	if (ctx.error)
+		snprintf(g_last_http_error, sizeof(g_last_http_error),
+			"%.63s", ctx.errmsg[0] ? ctx.errmsg : "stream error");
 
 	/* Cost tracking */
 	double pi = 5.0, pcw = 6.25, pcr = 0.50, po = 25.0;
@@ -1162,28 +1132,35 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		strftime(fetched_at, 32, "%Y-%m-%dT%H:%M:%S", tm);
 	}
 
-	/* In fix mode, collect step results into one line */
-	Buf fix_line;
-	if (g_fix_mode) buf_init(&fix_line);
+	/* Live one-line output. Each step prints its label (and cost/error) as
+	 * soon as it finishes, flushed so progress is visible.
+	 *
+	 *   VIDEOID metadata transcript formatting $0.03 full summary $0.05 ...
+	 *
+	 * If this run newly learned the title, transition to two-line output:
+	 *
+	 *   VIDEOID Title
+	 *    transcript formatting $0.03 full summary $0.05 ...
+	 *
+	 * In two-line mode we omit "metadata" since the title implies it. */
+	printf("%s", video_id);
+	fflush(stdout);
 	bool had_title = !EMPTY(title);
 
 	/* Fix metadata if missing */
 	bool desc_truncated = description && strlen(description) <= 200;
 	if (EMPTY(title) || EMPTY(upload_date) || EMPTY(duration) ||
 	    EMPTY(description) || EMPTY(channel_id) || desc_truncated) {
-		if (!g_fix_mode)
-			printf("Fixing metadata for %s\n", video_id);
 		g_last_http_error[0] = '\0';
 		Metadata m = fetch_youtube_metadata(video_id);
-		if (g_fix_mode) {
-			/* Print title now if we just learned it */
-			if (!had_title && !EMPTY(m.title))
-				printf("%s", m.title);
-			if (g_last_http_error[0])
-				buf_printf(&fix_line, " metadata:%s", g_last_http_error);
-			else
-				buf_printf(&fix_line, " metadata");
+		if (g_last_http_error[0]) {
+			printf(" metadata:%s", g_last_http_error);
+		} else if (!had_title && !EMPTY(m.title)) {
+			printf(" %s\n", m.title);
+		} else {
+			printf(" metadata");
 		}
+		fflush(stdout);
 		fill(&title, m.title, &changed); m.title = NULL;
 		fill(&upload_date, m.upload_date, &changed); m.upload_date = NULL;
 		fill(&duration, m.duration, &changed); m.duration = NULL;
@@ -1213,12 +1190,12 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 			bool found = sqlite3_step(st) == SQLITE_ROW;
 			sqlite3_finalize(st);
 			if (!found) {
-				if (!g_fix_mode)
-					printf("Fetching channel name for %s\n", video_id);
 				g_last_http_error[0] = '\0';
 				Metadata m = fetch_youtube_metadata(video_id);
-				if (g_fix_mode && g_last_http_error[0])
-					buf_printf(&fix_line, " channel:%s", g_last_http_error);
+				if (g_last_http_error[0]) {
+					printf(" channel:%s", g_last_http_error);
+					fflush(stdout);
+				}
 				channel_name = m.channel_name; m.channel_name = NULL;
 				channel_handle = m.channel_handle; m.channel_handle = NULL;
 				metadata_free(&m);
@@ -1274,23 +1251,21 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 
 	/* Fix raw transcript if missing */
 	if (EMPTY(raw_transcript)) {
-		if (!g_fix_mode)
-			printf("Fetching transcript for %s\n", video_id);
 		g_last_http_error[0] = '\0';
 		char *lang = NULL;
 		char *rt = fetch_raw_transcript(video_id, &lang);
-		if (g_fix_mode) {
-			if (g_last_http_error[0])
-				buf_printf(&fix_line, " transcript:%s", g_last_http_error);
-			else
-				buf_printf(&fix_line, " transcript");
-		}
+		if (g_last_http_error[0])
+			printf(" transcript:%s", g_last_http_error);
+		else
+			printf(" transcript");
+		fflush(stdout);
 		if (rt) { free(raw_transcript); raw_transcript = rt; changed = true; }
 		if (lang) { free(language); language = lang; changed = true; }
 	}
 
 	/* Build cached prefix for Claude calls */
 	char *cached_prefix = NULL;
+	double video_cost = 0;
 	bool needs_format = EMPTY(transcript_formatted) && !EMPTY(raw_transcript);
 	bool needs_full = EMPTY(summary_full) && !EMPTY(raw_transcript);
 	bool needs_short = EMPTY(summary_short) && !EMPTY(raw_transcript);
@@ -1313,10 +1288,8 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 
 	/* Generate formatted transcript */
 	if (needs_format) {
-		if (!g_fix_mode) {
-			printf("Formatting transcript for %s", video_id);
-			fflush(stdout);
-		}
+		printf(" formatting");
+		fflush(stdout);
 		g_last_http_error[0] = '\0';
 		g_last_cost = 0;
 		char *raw = generate_with_claude(
@@ -1327,14 +1300,13 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 			"Group into logical paragraphs, break run-on sentences, "
 			"remove fillers where they disrupt flow. Keep content faithful.",
 			cached_prefix, model, 16000);
-		if (g_fix_mode) {
-			if (g_last_http_error[0])
-				buf_printf(&fix_line, " format:%s", g_last_http_error);
-			else
-				buf_printf(&fix_line, " format:$%.4f", g_last_cost);
+		if (g_last_http_error[0]) {
+			printf(":%s", g_last_http_error);
 		} else {
-			printf(" $%.4f\n", g_last_cost);
+			printf(" $%.4f", g_last_cost);
+			video_cost += g_last_cost;
 		}
+		fflush(stdout);
 		free(transcript_formatted);
 		transcript_formatted = wordwrap(raw);
 		free(raw);
@@ -1343,10 +1315,8 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 
 	/* Generate full summary */
 	if (needs_full) {
-		if (!g_fix_mode) {
-			printf("Generating full summary for %s", video_id);
-			fflush(stdout);
-		}
+		printf(" full summary");
+		fflush(stdout);
 		g_last_http_error[0] = '\0';
 		g_last_cost = 0;
 		char *raw = generate_with_claude(
@@ -1355,14 +1325,13 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 			"Make it nicely formatted with headings, paragraphs, and bullets "
 			"where appropriate.",
 			cached_prefix, model, 16000);
-		if (g_fix_mode) {
-			if (g_last_http_error[0])
-				buf_printf(&fix_line, " summary_full:%s", g_last_http_error);
-			else
-				buf_printf(&fix_line, " summary_full:$%.4f", g_last_cost);
+		if (g_last_http_error[0]) {
+			printf(":%s", g_last_http_error);
 		} else {
-			printf(" $%.4f\n", g_last_cost);
+			printf(" $%.4f", g_last_cost);
+			video_cost += g_last_cost;
 		}
+		fflush(stdout);
 		free(summary_full);
 		summary_full = wordwrap(raw);
 		free(raw);
@@ -1371,24 +1340,21 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 
 	/* Generate short summary */
 	if (needs_short) {
-		if (!g_fix_mode) {
-			printf("Generating short summary for %s", video_id);
-			fflush(stdout);
-		}
+		printf(" short summary");
+		fflush(stdout);
 		g_last_http_error[0] = '\0';
 		g_last_cost = 0;
 		char *raw = generate_with_claude(
 			"Create a concise one-paragraph summary of this video. "
 			"Capture key points, main ideas, and conclusions.",
 			cached_prefix, model, 500);
-		if (g_fix_mode) {
-			if (g_last_http_error[0])
-				buf_printf(&fix_line, " summary_short:%s", g_last_http_error);
-			else
-				buf_printf(&fix_line, " summary_short:$%.4f", g_last_cost);
+		if (g_last_http_error[0]) {
+			printf(":%s", g_last_http_error);
 		} else {
-			printf(" $%.4f\n", g_last_cost);
+			printf(" $%.4f", g_last_cost);
+			video_cost += g_last_cost;
 		}
+		fflush(stdout);
 		free(summary_short);
 		summary_short = wordwrap(raw);
 		free(raw);
@@ -1396,15 +1362,9 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	}
 
 	free(cached_prefix);
-
-	/* In fix mode, print collected actions as one line */
-	if (g_fix_mode && fix_line.len > 0) {
-		printf(" %s\n", fix_line.data);
-		buf_free(&fix_line);
-	} else if (g_fix_mode) {
-		printf("\n");
-		buf_free(&fix_line);
-	}
+	if (video_cost > 0)
+		printf(" total $%.4f", video_cost);
+	printf("\n");
 
 	/* Set updated_at only if data changed */
 	if (changed) {
@@ -1479,8 +1439,8 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 	while (queue->count > 0 && !g_interrupted) {
 		int prev_timeouts = 0;
 		char *vid = queue_pop(queue, &prev_timeouts);
-		printf("[%d done, %d remaining of %d] %s\n",
-			done, queue->count + 1, total, vid);
+		printf("[%d done, %d remaining of %d] ",
+			done, queue->count + 1, total);
 		fflush(stdout);
 
 		queue_state_save(db, queue_name, vid);
@@ -1744,7 +1704,6 @@ int main(int argc, char **argv)
 	backoff_init(&bo, opt_min_delay, opt_max_backoff, opt_initial_delay, 3, 2);
 
 	if (fix || (fix_full && nurls == 0)) {
-		g_fix_mode = true;
 		/* Build queue from videos with missing fields */
 		sqlite3_stmt *st;
 		char fix_sql[1024];
@@ -1942,20 +1901,28 @@ int main(int argc, char **argv)
 			if (video_id) {
 				sqlite3_stmt *st;
 				sqlite3_prepare_v2(db,
-					"SELECT raw_transcript FROM videos WHERE video_id = ?",
-					-1, &st, NULL);
+					"SELECT v.raw_transcript, "
+					"COALESCE(c.bulkdl, 0) "
+					"FROM videos v "
+					"LEFT JOIN channels c "
+					"ON c.channel_id = v.channel_id "
+					"WHERE v.video_id = ?", -1, &st, NULL);
 				sqlite3_bind_text(st, 1, video_id, -1, SQLITE_STATIC);
 				bool exists = false;
+				bool bulkdl = false;
 				if (sqlite3_step(st) == SQLITE_ROW) {
 					const char *rt = (const char *)sqlite3_column_text(st, 0);
 					if (rt && *rt) exists = true;
+					bulkdl = sqlite3_column_int(st, 1) != 0;
 				}
 				sqlite3_finalize(st);
-				if (exists)
-					printf("Transcript already downloaded for %s. Skipping.\n",
-						video_id);
-				else
+				if (exists && bulkdl && !no_summary) {
+					process_video(video_id, db, false);
+				} else if (exists) {
+					printf("%s already downloaded\n", video_id);
+				} else {
 					process_video(video_id, db, no_summary);
+				}
 				free(video_id);
 			}
 		} else if (nvids > 1) {
