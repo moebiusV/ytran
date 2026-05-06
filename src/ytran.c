@@ -317,6 +317,60 @@ bad:
 	return NULL;
 }
 
+/* Resolve a channel URL to a channel_id (UCxxx). For /channel/UCxxx the
+ * id is parsed directly; for /@handle, /c/name, /user/name we look up
+ * channel_names in the DB. Returns NULL (with stderr message) when the
+ * channel isn't known yet. Caller frees. */
+static char *resolve_channel_id_from_url(const char *url, sqlite3 *db)
+{
+	const char *p = strstr(url, "/channel/");
+	if (p) {
+		p += 9;
+		const char *e = p;
+		while (*e && *e != '/' && *e != '?') e++;
+		return strndup(p, e - p);
+	}
+	const char *tok_start = NULL;
+	bool is_handle = false;  /* /@... — stored with leading '@' */
+	if ((p = strstr(url, "/@"))) { tok_start = p + 2; is_handle = true; }
+	else if ((p = strstr(url, "/c/"))) tok_start = p + 3;
+	else if ((p = strstr(url, "/user/"))) tok_start = p + 6;
+	if (!tok_start) {
+		fprintf(stderr, "Cannot resolve channel URL: %s\n", url);
+		return NULL;
+	}
+	const char *e = tok_start;
+	while (*e && *e != '/' && *e != '?') e++;
+	char *tok = strndup(tok_start, e - tok_start);
+
+	sqlite3_stmt *st;
+	char *cid = NULL;
+	if (is_handle) {
+		char with_at[256];
+		snprintf(with_at, sizeof(with_at), "@%s", tok);
+		sqlite3_prepare_v2(db,
+			"SELECT channel_id FROM channel_names "
+			"WHERE name_type='handle' AND name=? "
+			"ORDER BY timestamp DESC LIMIT 1", -1, &st, NULL);
+		sqlite3_bind_text(st, 1, with_at, -1, SQLITE_STATIC);
+	} else {
+		sqlite3_prepare_v2(db,
+			"SELECT channel_id FROM channel_names "
+			"WHERE (name_type='handle' AND name=?) "
+			"OR (name_type='fullname' AND name=?) "
+			"ORDER BY timestamp DESC LIMIT 1", -1, &st, NULL);
+		sqlite3_bind_text(st, 1, tok, -1, SQLITE_STATIC);
+		sqlite3_bind_text(st, 2, tok, -1, SQLITE_STATIC);
+	}
+	if (sqlite3_step(st) == SQLITE_ROW)
+		cid = strdup((const char *)sqlite3_column_text(st, 0));
+	sqlite3_finalize(st);
+	free(tok);
+	if (!cid)
+		fprintf(stderr, "Cannot resolve channel URL: %s (not in DB yet)\n", url);
+	return cid;
+}
+
 /* ── Video queue (circular FIFO) ── */
 
 static void queue_init(VideoQueue *q) { memset(q, 0, sizeof(*q)); }
@@ -480,14 +534,22 @@ static void mark_channel_bulkdl(sqlite3 *db, const char *channel_id)
 
 /* ── DB helpers for batch mode ── */
 
-static void filter_already_downloaded(VideoQueue *q, sqlite3 *db)
+static void filter_already_downloaded(VideoQueue *q, sqlite3 *db,
+                                      bool keep_bulkdl)
 {
-	/* Build set of video IDs already in DB with transcripts */
+	/* Build set of video IDs already in DB with transcripts. When
+	 * keep_bulkdl is true, videos whose channel is flagged bulkdl are
+	 * left in the queue so they get re-processed (i.e. resummarized) —
+	 * mirroring the single-video path's behavior. */
 	sqlite3_stmt *st;
-	sqlite3_prepare_v2(db,
-		"SELECT video_id FROM videos "
-		"WHERE raw_transcript IS NOT NULL AND raw_transcript != ''",
-		-1, &st, NULL);
+	const char *sql = keep_bulkdl
+		? "SELECT v.video_id FROM videos v "
+		  "LEFT JOIN channels c ON c.channel_id = v.channel_id "
+		  "WHERE v.raw_transcript IS NOT NULL AND v.raw_transcript != '' "
+		  "AND COALESCE(c.bulkdl, 0) = 0"
+		: "SELECT video_id FROM videos "
+		  "WHERE raw_transcript IS NOT NULL AND raw_transcript != ''";
+	sqlite3_prepare_v2(db, sql, -1, &st, NULL);
 	/* Simple linear search — adequate for typical channel sizes */
 	char **done = NULL;
 	int ndone = 0, dcap = 0;
@@ -1122,7 +1184,16 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	}
 	sqlite3_finalize(st);
 	int old_raw_only = raw_only;
-	raw_only = no_summary ? 1 : 0;
+	bool row_exists = (fetched_at != NULL);
+	/* raw_only=0 is sticky: once a video has been fully summarized it
+	 * stays that way. Channel/bulk downloads set raw_only=1 on first
+	 * sight; later --fix-full (or any no_summary=false pass) promotes
+	 * 1 → 0. We never demote 0 → 1. */
+	if (!row_exists)
+		raw_only = no_summary ? 1 : 0;
+	else if (old_raw_only == 1 && !no_summary)
+		raw_only = 0;
+	/* else: leave as-is */
 	if (raw_only != old_raw_only) changed = true;
 
 	if (!fetched_at) {
@@ -1133,19 +1204,18 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	}
 
 	/* Live one-line output. Each step prints its label (and cost/error) as
-	 * soon as it finishes, flushed so progress is visible.
+	 * soon as it finishes, flushed so progress is visible. The title is
+	 * shown right after the video id (either from cache, or once newly
+	 * fetched as part of metadata):
 	 *
-	 *   VIDEOID metadata transcript formatting $0.03 full summary $0.05 ...
+	 *   VIDEOID Title metadata transcript formatting $0.03 ...
 	 *
-	 * If this run newly learned the title, transition to two-line output:
-	 *
-	 *   VIDEOID Title
-	 *    transcript formatting $0.03 full summary $0.05 ...
-	 *
-	 * In two-line mode we omit "metadata" since the title implies it. */
+	 * When the title was learned this run we omit the "metadata" label
+	 * since printing the title already implies the fetch happened. */
 	printf("%s", video_id);
-	fflush(stdout);
 	bool had_title = !EMPTY(title);
+	if (had_title) printf(" %s", title);
+	fflush(stdout);
 
 	/* Fix metadata if missing */
 	bool desc_truncated = description && strlen(description) <= 200;
@@ -1156,7 +1226,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		if (g_last_http_error[0]) {
 			printf(" metadata:%s", g_last_http_error);
 		} else if (!had_title && !EMPTY(m.title)) {
-			printf(" %s\n", m.title);
+			printf(" %s", m.title);
 		} else {
 			printf(" metadata");
 		}
@@ -1423,15 +1493,21 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
                       bool no_summary, const char *queue_name)
 {
-	/* Resume from last run */
-	char *cursor = queue_state_load(db, queue_name);
-	if (cursor) {
-		queue_rotate_to(queue, cursor);
-		printf("Resuming after %s\n", cursor);
-		free(cursor);
+	int total = queue->count;
+	/* Resume + per-video progress prefix only matter for actual batches.
+	 * For a queue of one (the unified single-video path) there's nothing
+	 * to resume, and the "[0 done, 1 remaining of 1]" prefix is just
+	 * noise — so suppress the bookkeeping when total == 1. */
+	bool track = total > 1;
+	if (track) {
+		char *cursor = queue_state_load(db, queue_name);
+		if (cursor) {
+			queue_rotate_to(queue, cursor);
+			printf("Resuming after %s\n", cursor);
+			free(cursor);
+		}
 	}
 
-	int total = queue->count;
 	int done = 0;
 	int timed_out_skipped = 0;
 	double tmo_delay = bo->min_delay;
@@ -1439,11 +1515,13 @@ static void run_batch(VideoQueue *queue, sqlite3 *db, Backoff *bo,
 	while (queue->count > 0 && !g_interrupted) {
 		int prev_timeouts = 0;
 		char *vid = queue_pop(queue, &prev_timeouts);
-		printf("[%d done, %d remaining of %d] ",
-			done, queue->count + 1, total);
-		fflush(stdout);
+		if (track) {
+			printf("[%d done, %d remaining of %d] ",
+				done, queue->count + 1, total);
+			fflush(stdout);
+		}
 
-		queue_state_save(db, queue_name, vid);
+		if (track) queue_state_save(db, queue_name, vid);
 		int result = process_video(vid, db, no_summary);
 
 		switch (result) {
@@ -1610,8 +1688,10 @@ int main(int argc, char **argv)
 		} else if (is_arg(a, "--help") || is_arg(a, "-h")) {
 			printf("Usage: ytran [OPTIONS] [URL_OR_ID_OR_CHANNEL ...]\n"
 			       "  --browse            Browse the transcript database\n"
-			       "  --fix               Fill in missing fields (with backoff)\n"
-			       "  --fix-full [VID ...] Like --fix, but includes raw-only videos\n"
+			       "  --fix [URL ...]     Fill in missing fields (raw_only respected).\n"
+			       "                      URLs/channels scope the operation.\n"
+			       "  --fix-full [URL ...] Like --fix, but promotes raw-only videos to\n"
+			       "                      full summaries. Respects --no-summary.\n"
 			       "  --haiku             Use claude-haiku-4-5\n"
 			       "  --sonnet            Use claude-sonnet-4-6\n"
 			       "  --model MODEL       Claude model [%s]\n"
@@ -1703,12 +1783,75 @@ int main(int argc, char **argv)
 	Backoff bo;
 	backoff_init(&bo, opt_min_delay, opt_max_backoff, opt_initial_delay, 3, 2);
 
-	if (fix || (fix_full && nurls == 0)) {
-		/* Build queue from videos with missing fields */
+	if (fix || fix_full) {
+		/* Two queues:
+		 *   Full queue  — raw_only=0/NULL videos with any gap. Run with
+		 *                 no_summary=false so missing summaries get filled.
+		 *   Raw queue   — raw_only=1 videos with missing metadata or raw
+		 *                 transcript only (summary fields are expected to
+		 *                 be empty). Run with no_summary=true to preserve
+		 *                 raw_only and skip Claude calls.
+		 *   --fix-full  — single queue over everything, no_summary=false,
+		 *                 promoting raw_only videos to full summaries.
+		 *
+		 * URLs (video URLs/IDs and channel URLs) scope the operation:
+		 * with URLs, only matching rows are queued. */
+		char **fv = NULL; int nfv = 0;  /* video_id filter */
+		char **fc = NULL; int nfc = 0;  /* channel_id filter */
+		for (int i = 0; i < nurls; i++) {
+			if (is_channel_url(urls[i])) {
+				char *cid = resolve_channel_id_from_url(urls[i], db);
+				if (cid) {
+					fc = realloc(fc, (nfc + 1) * sizeof(char *));
+					fc[nfc++] = cid;
+				}
+			} else {
+				char *vid = extract_youtube_id(urls[i]);
+				if (vid) {
+					fv = realloc(fv, (nfv + 1) * sizeof(char *));
+					fv[nfv++] = vid;
+				}
+			}
+		}
+		bool has_filter = (nfv + nfc) > 0;
+		/* Build " AND (video_id IN (...) OR channel_id IN (...))" or "". */
+		char *filter = NULL;
+		if (has_filter) {
+			size_t sz = 64;
+			for (int i = 0; i < nfv; i++) sz += strlen(fv[i]) + 4;
+			for (int i = 0; i < nfc; i++) sz += strlen(fc[i]) + 4;
+			filter = malloc(sz);
+			char *p = filter;
+			p += sprintf(p, " AND (");
+			if (nfv > 0) {
+				p += sprintf(p, "video_id IN (");
+				for (int i = 0; i < nfv; i++)
+					p += sprintf(p, "%s'%s'", i ? "," : "", fv[i]);
+				p += sprintf(p, ")");
+			}
+			if (nfc > 0) {
+				if (nfv > 0) p += sprintf(p, " OR ");
+				p += sprintf(p, "channel_id IN (");
+				for (int i = 0; i < nfc; i++)
+					p += sprintf(p, "%s'%s'", i ? "," : "", fc[i]);
+				p += sprintf(p, ")");
+			}
+			sprintf(p, ")");
+		} else {
+			filter = strdup("");
+		}
+
 		sqlite3_stmt *st;
-		char fix_sql[1024];
-		snprintf(fix_sql, sizeof(fix_sql),
-			"SELECT video_id FROM videos WHERE "
+		VideoQueue fullq, rawq;
+		queue_init(&fullq);
+		queue_init(&rawq);
+
+		const char *full_pred = fix_full
+			? ""
+			: "(raw_only IS NULL OR raw_only = 0) AND ";
+		char *full_sql;
+		if (asprintf(&full_sql,
+			"SELECT video_id FROM videos WHERE %s"
 			"(title = '' OR upload_date = '' OR duration = '' OR description = '' OR "
 			"channel_id = '' OR language = '' OR raw_transcript = '' OR "
 			"transcript_formatted = '' OR summary_short = '' OR summary_full = '' OR "
@@ -1717,38 +1860,87 @@ int main(int argc, char **argv)
 			"raw_transcript IS NULL OR transcript_formatted IS NULL OR "
 			"summary_short IS NULL OR summary_full IS NULL OR length(description) <= 200)"
 			"%s",
-			fix_full ? "" : " AND (raw_only IS NULL OR raw_only = 0)");
-		sqlite3_prepare_v2(db, fix_sql, -1, &st, NULL);
-		VideoQueue fixq;
-		queue_init(&fixq);
+			full_pred, filter) < 0) full_sql = NULL;
+		sqlite3_prepare_v2(db, full_sql, -1, &st, NULL);
 		while (sqlite3_step(st) == SQLITE_ROW) {
 			const char *vid = (const char *)sqlite3_column_text(st, 0);
 			bool skip = false;
 			for (int i = 0; i < nskip; i++)
 				if (strcmp(vid, skip_ids[i]) == 0) { skip = true; break; }
 			if (!skip)
-				queue_push(&fixq, vid);
+				queue_push(&fullq, vid);
 		}
 		sqlite3_finalize(st);
+		free(full_sql);
 
-		if (fixq.count > 0) {
-			printf("Found %d videos to fix\n", fixq.count);
-			run_batch(&fixq, db, &bo, false, "fix");
-		} else {
+		/* Raw-only queue: only populated for plain --fix (not --fix-full). */
+		if (!fix_full) {
+			char *raw_sql;
+			if (asprintf(&raw_sql,
+				"SELECT video_id FROM videos WHERE raw_only = 1 AND "
+				"(title = '' OR upload_date = '' OR duration = '' OR description = '' OR "
+				"channel_id = '' OR language = '' OR raw_transcript = '' OR "
+				"title IS NULL OR upload_date IS NULL OR duration IS NULL OR "
+				"description IS NULL OR channel_id IS NULL OR language IS NULL OR "
+				"raw_transcript IS NULL OR length(description) <= 200)"
+				"%s",
+				filter) < 0) raw_sql = NULL;
+			sqlite3_prepare_v2(db, raw_sql, -1, &st, NULL);
+			while (sqlite3_step(st) == SQLITE_ROW) {
+				const char *vid = (const char *)sqlite3_column_text(st, 0);
+				bool skip = false;
+				for (int i = 0; i < nskip; i++)
+					if (strcmp(vid, skip_ids[i]) == 0) { skip = true; break; }
+				if (!skip)
+					queue_push(&rawq, vid);
+			}
+			sqlite3_finalize(st);
+			free(raw_sql);
+		}
+
+		if (fullq.count == 0 && rawq.count == 0) {
 			printf("Nothing to fix\n");
 		}
-		queue_free(&fixq);
+		if (fullq.count > 0) {
+			printf("Found %d videos to fix\n", fullq.count);
+			run_batch(&fullq, db, &bo, no_summary, "fix");
+		}
+		if (rawq.count > 0) {
+			printf("Found %d raw-only videos to fix\n", rawq.count);
+			run_batch(&rawq, db, &bo, true, "fix-raw");
+		}
+		queue_free(&fullq);
+		queue_free(&rawq);
 
-		/* Populate channel_names for channels missing entries */
+		/* Populate channel_names for channels missing entries. With URL
+		 * filters, scope the backfill to the requested channels only. */
 		typedef struct { char *ch_id; char *vid; } ChFix;
 		ChFix *ch_fixes = NULL;
 		int nch = 0;
-		sqlite3_prepare_v2(db,
-			"SELECT v.channel_id, MIN(v.video_id) "
-			"FROM videos v LEFT JOIN channel_names cn ON v.channel_id = cn.channel_id "
-			"WHERE v.channel_id IS NOT NULL AND v.channel_id <> '' "
-			"AND cn.channel_id IS NULL GROUP BY v.channel_id",
-			-1, &st, NULL);
+		char *ch_sql;
+		if (has_filter) {
+			/* Only consider channels referenced by the filtered videos. */
+			Buf b;
+			buf_init(&b);
+			const char *prefix =
+				"SELECT v.channel_id, MIN(v.video_id) "
+				"FROM videos v LEFT JOIN channel_names cn ON v.channel_id = cn.channel_id "
+				"WHERE v.channel_id IS NOT NULL AND v.channel_id <> '' "
+				"AND cn.channel_id IS NULL";
+			buf_append(&b, prefix, strlen(prefix));
+			buf_append(&b, filter, strlen(filter));
+			const char *suffix = " GROUP BY v.channel_id";
+			buf_append(&b, suffix, strlen(suffix));
+			buf_append(&b, "", 1);  /* NUL */
+			ch_sql = b.data;
+		} else {
+			ch_sql = strdup(
+				"SELECT v.channel_id, MIN(v.video_id) "
+				"FROM videos v LEFT JOIN channel_names cn ON v.channel_id = cn.channel_id "
+				"WHERE v.channel_id IS NOT NULL AND v.channel_id <> '' "
+				"AND cn.channel_id IS NULL GROUP BY v.channel_id");
+		}
+		sqlite3_prepare_v2(db, ch_sql, -1, &st, NULL);
 		while (sqlite3_step(st) == SQLITE_ROW) {
 			ch_fixes = realloc(ch_fixes, (nch + 1) * sizeof(ChFix));
 			ch_fixes[nch].ch_id = strdup((const char *)sqlite3_column_text(st, 0));
@@ -1756,6 +1948,7 @@ int main(int argc, char **argv)
 			nch++;
 		}
 		sqlite3_finalize(st);
+		free(ch_sql);
 		for (int i = 0; i < nch; i++) {
 			g_last_http_error[0] = '\0';
 			Metadata m = fetch_youtube_metadata(ch_fixes[i].vid);
@@ -1794,29 +1987,12 @@ int main(int argc, char **argv)
 			free(ch_fixes[i].vid);
 		}
 		free(ch_fixes);
-	}
 
-	if (fix_full && nurls > 0) {
-		/* Process specific videos with full summarization */
-		VideoQueue ffq;
-		queue_init(&ffq);
-		for (int i = 0; i < nurls; i++) {
-			char *video_id = extract_youtube_id(urls[i]);
-			if (video_id) {
-				queue_push(&ffq, video_id);
-				free(video_id);
-			}
-		}
-		if (ffq.count == 1) {
-			char *vid = queue_pop(&ffq, NULL);
-			process_video(vid, db, false);
-			free(vid);
-		} else if (ffq.count > 1) {
-			backoff_init(&bo, opt_min_delay, opt_max_backoff,
-				opt_initial_delay, 3, 2);
-			run_batch(&ffq, db, &bo, false, "fix-full");
-		}
-		queue_free(&ffq);
+		free(filter);
+		for (int i = 0; i < nfv; i++) free(fv[i]);
+		free(fv);
+		for (int i = 0; i < nfc; i++) free(fc[i]);
+		free(fc);
 	}
 
 	if (!fix && !fix_full && nurls > 0) {
@@ -1851,7 +2027,7 @@ int main(int argc, char **argv)
 					orig_ids[k] = strdup(chanq.ids[k]);
 			}
 
-			filter_already_downloaded(&chanq, db);
+			filter_already_downloaded(&chanq, db, false);
 			if (chanq.count > 0) {
 				printf("%d videos to process\n", chanq.count);
 				backoff_init(&bo, opt_min_delay, opt_max_backoff,
@@ -1894,39 +2070,10 @@ int main(int argc, char **argv)
 		}
 		free(chan_urls);
 
-		/* Process video URLs */
-		if (nvids == 1) {
-			/* Single video — direct processing, no queue */
-			char *video_id = extract_youtube_id(vid_urls[0]);
-			if (video_id) {
-				sqlite3_stmt *st;
-				sqlite3_prepare_v2(db,
-					"SELECT v.raw_transcript, "
-					"COALESCE(c.bulkdl, 0) "
-					"FROM videos v "
-					"LEFT JOIN channels c "
-					"ON c.channel_id = v.channel_id "
-					"WHERE v.video_id = ?", -1, &st, NULL);
-				sqlite3_bind_text(st, 1, video_id, -1, SQLITE_STATIC);
-				bool exists = false;
-				bool bulkdl = false;
-				if (sqlite3_step(st) == SQLITE_ROW) {
-					const char *rt = (const char *)sqlite3_column_text(st, 0);
-					if (rt && *rt) exists = true;
-					bulkdl = sqlite3_column_int(st, 1) != 0;
-				}
-				sqlite3_finalize(st);
-				if (exists && bulkdl && !no_summary) {
-					process_video(video_id, db, false);
-				} else if (exists) {
-					printf("%s already downloaded\n", video_id);
-				} else {
-					process_video(video_id, db, no_summary);
-				}
-				free(video_id);
-			}
-		} else if (nvids > 1) {
-			/* Multiple videos — batch mode with backoff */
+		/* Process video URLs — one or many, same path. run_batch
+		 * suppresses its progress prefix and resume bookkeeping for a
+		 * queue of one, so single-video output stays clean. */
+		if (nvids > 0) {
 			VideoQueue vidq;
 			queue_init(&vidq);
 			for (int i = 0; i < nvids; i++) {
@@ -1936,7 +2083,7 @@ int main(int argc, char **argv)
 					free(video_id);
 				}
 			}
-			filter_already_downloaded(&vidq, db);
+			filter_already_downloaded(&vidq, db, !no_summary);
 			if (vidq.count > 0) {
 				backoff_init(&bo, opt_min_delay, opt_max_backoff,
 					opt_initial_delay, 3, 2);
