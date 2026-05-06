@@ -1183,6 +1183,16 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		updated_at = db_text(st, 12);
 	}
 	sqlite3_finalize(st);
+	/* "[timeout]" markers are written when a video hits the 408 give-up
+	 * threshold. Treat them as empty here so --fix retries the fetch;
+	 * if it times out 4× again the marker gets re-stamped. (Other "[…]"
+	 * markers — e.g. "[Subtitles are disabled]" from 404 — are left as
+	 * permanent.) */
+	if (raw_transcript && strcmp(raw_transcript, "[timeout]") == 0) {
+		free(raw_transcript);
+		raw_transcript = NULL;
+		changed = true;
+	}
 	int old_raw_only = raw_only;
 	bool row_exists = (fetched_at != NULL);
 	/* raw_only=0 is sticky: once a video has been fully summarized it
@@ -1854,6 +1864,7 @@ int main(int argc, char **argv)
 			"SELECT video_id FROM videos WHERE %s"
 			"(title = '' OR upload_date = '' OR duration = '' OR description = '' OR "
 			"channel_id = '' OR language = '' OR raw_transcript = '' OR "
+			"raw_transcript = '[timeout]' OR "
 			"transcript_formatted = '' OR summary_short = '' OR summary_full = '' OR "
 			"title IS NULL OR upload_date IS NULL OR duration IS NULL OR "
 			"description IS NULL OR channel_id IS NULL OR language IS NULL OR "
@@ -1880,6 +1891,7 @@ int main(int argc, char **argv)
 				"SELECT video_id FROM videos WHERE raw_only = 1 AND "
 				"(title = '' OR upload_date = '' OR duration = '' OR description = '' OR "
 				"channel_id = '' OR language = '' OR raw_transcript = '' OR "
+				"raw_transcript = '[timeout]' OR "
 				"title IS NULL OR upload_date IS NULL OR duration IS NULL OR "
 				"description IS NULL OR channel_id IS NULL OR language IS NULL OR "
 				"raw_transcript IS NULL OR length(description) <= 200)"
