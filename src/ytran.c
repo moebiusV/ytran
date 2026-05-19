@@ -1178,6 +1178,13 @@ static void db_init(sqlite3 *db)
 		"WHERE v.raw_only = 0 OR v.raw_only IS NULL",
 		NULL, NULL, NULL);
 
+	/* Drillthrough: videos_done -> videos via video_id */
+	sqlite3_exec(db,
+		"INSERT OR REPLACE INTO _browse_config (key, value) "
+		"VALUES ('view_drillthrough:videos_done', "
+		"'video_id:videos:SELECT * FROM videos WHERE video_id = ?')",
+		NULL, NULL, NULL);
+
 	/* Drop vestigial transcript column */
 	sqlite3_exec(db, "ALTER TABLE videos DROP COLUMN transcript", NULL, NULL, NULL);
 
