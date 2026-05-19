@@ -1,4 +1,4 @@
-.TH YTRAN 1 "2026-04-14" "ytran 1.1" "User Commands"
+.TH YTRAN 1 "May 2026" "ytran 1.1" "User Commands"
 .SH NAME
 ytran \- fetch and summarize YouTube video transcripts
 .SH SYNOPSIS
@@ -29,6 +29,9 @@ and retried until 4 consecutive failures at the backoff ceiling.
 .BR \-b ", " \-\-browse
 Open an interactive browser for the transcript database after processing
 any URLs given on the command line.
+Videos are shown sorted by
+.B updated_at DESC
+(most recently modified first).
 If invoked with no arguments,
 .B \-\-browse
 is implied.
@@ -41,10 +44,10 @@ Uses circular retry queue with backoff for transient failures.
 Entries saved with
 .B \-\-no\-summary
 are skipped; use
-.B \-\-fix\-full
+.B \-\-full
 to include them.
 .TP
-.B \-\-fix\-full
+.BR \-\-full " (" \-F )
 Like
 .BR \-\-fix ,
 but includes raw\-only entries (those saved with
@@ -91,9 +94,10 @@ runs leave it alone.
 Does not require an Anthropic API key.
 .TP
 .BI \-\-skip " ID1,ID2,..."
-Comma-separated list of video IDs to skip during \-\-fix operations.
+Comma-separated list of video IDs to skip during batch operations
+.RB ( \-\-fix ", " \-\-full ", channel, or multi-URL downloads).
 .TP
-.B \-\-version
+.BR \-\-version " (" \-V )
 Print version and exit.
 .SH BATCH MODES
 .PP
@@ -137,6 +141,38 @@ transcriptapi.com bearer token.
 .TP
 .I ~/.anthropic_api_key
 Anthropic API key for Claude.
+.SH DATABASE
+The database at
+.I ~/.local/share/ytran/youtube-transcripts.db
+contains the following tables:
+.TP
+.B videos
+One row per video. Three timestamp columns track the video lifecycle:
+.BR "upload_date" " (YouTube's date),"
+.BR "fetched_at" " (first download by ytran), and"
+.BR "updated_at" " (last modified by --fix/--full)."
+.B updated_at
+is seeded from
+.B fetched_at
+on first download and bumped whenever
+.B \-\-fix
+or
+.B \-\-full
+generates new content.
+.TP
+.B channel_names
+Historical channel name and handle tracking.
+.TP
+.B channels
+Per-channel flags (e.g.,
+.BR bulkdl ).
+.TP
+.B queue_state
+Cursor position for resuming interrupted batch operations.
+.TP
+.B _browse_config
+browse-sqlite3 display preferences, including the default sort
+.BR "row_sort:videos = [[\"updated_at\",\"DESC\"]]" .
 .SH SEE ALSO
 .BR yt\-dlp (1)
 \(em used for expanding channel URLs to video lists.
