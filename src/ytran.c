@@ -1175,10 +1175,7 @@ static void db_init(sqlite3 *db)
 		"  v.raw_only,"
 		"  v.updated_at "
 		"FROM videos v "
-		"LEFT JOIN channels c ON v.channel_id = c.channel_id "
-		"WHERE NOT (c.bulkdl = 1 "
-		"           AND v.summary_full IS NULL "
-		"           AND v.summary_short IS NULL)",
+		"WHERE v.raw_only = 0 OR v.raw_only IS NULL",
 		NULL, NULL, NULL);
 
 	/* Drop vestigial transcript column */
@@ -1793,8 +1790,15 @@ int main(int argc, char **argv)
 	if (!fix && !full_mode && !browse && nurls < 1)
 		browse = true;
 
-	/* browse-only: no URLs to process, go straight to the browser */
+	/* browse-only: no URLs to process, open DB briefly to ensure views
+	 * and config tables exist, then hand off to the browser. */
 	if (browse && !fix && !full_mode && nurls < 1) {
+		mkdir(db_dir, 0755);
+		sqlite3 *browse_db;
+		if (sqlite3_open(db_file, &browse_db) == SQLITE_OK) {
+			db_init(browse_db);
+			sqlite3_close(browse_db);
+		}
 		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos_done", (char *)NULL);
 		perror("browse-sqlite3");
 		return 1;
