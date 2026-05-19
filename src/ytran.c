@@ -1127,6 +1127,21 @@ static void db_init(sqlite3 *db)
 		NULL, NULL, NULL);
 	sqlite3_exec(db, "ALTER TABLE videos ADD COLUMN updated_at TEXT",
 		NULL, NULL, NULL);
+	/* Backfill: for any existing row where updated_at is NULL but fetched_at is
+	 * set, seed updated_at from fetched_at so it's never NULL going forward. */
+	sqlite3_exec(db,
+		"UPDATE videos SET updated_at = fetched_at "
+		"WHERE updated_at IS NULL AND fetched_at IS NOT NULL",
+		NULL, NULL, NULL);
+
+	/* Default sort: most recently modified videos first */
+	sqlite3_exec(db,
+		"CREATE TABLE IF NOT EXISTS _browse_config ("
+		"key TEXT PRIMARY KEY, value TEXT NOT NULL)", NULL, NULL, NULL);
+	sqlite3_exec(db,
+		"INSERT OR IGNORE INTO _browse_config (key, value) "
+		"VALUES ('row_sort:videos', '[[\"updated_at\",\"DESC\"]]')",
+		NULL, NULL, NULL);
 
 	/* Drop vestigial transcript column */
 	sqlite3_exec(db, "ALTER TABLE videos DROP COLUMN transcript", NULL, NULL, NULL);
@@ -1197,7 +1212,7 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 	bool row_exists = (fetched_at != NULL);
 	/* raw_only=0 is sticky: once a video has been fully summarized it
 	 * stays that way. Channel/bulk downloads set raw_only=1 on first
-	 * sight; later --fix-full (or any no_summary=false pass) promotes
+	 * sight; later --full (or any no_summary=false pass) promotes
 	 * 1 → 0. We never demote 0 → 1. */
 	if (!row_exists)
 		raw_only = no_summary ? 1 : 0;
@@ -1212,6 +1227,9 @@ static int process_video(const char *video_id, sqlite3 *db, bool no_summary)
 		fetched_at = malloc(32);
 		strftime(fetched_at, 32, "%Y-%m-%dT%H:%M:%S", tm);
 	}
+	/* First fetch: seed updated_at so it's never NULL */
+	if (!updated_at)
+		updated_at = strdup(fetched_at);
 
 	/* Live one-line output. Each step prints its label (and cost/error) as
 	 * soon as it finishes, flushed so progress is visible. The title is
@@ -1652,7 +1670,7 @@ static const char *is_arg_val(const char *a, const char *opt)
 
 int main(int argc, char **argv)
 {
-	bool browse = false, fix = false, fix_full = false, no_summary = false;
+	bool browse = false, fix = false, full_mode = false, no_summary = false;
 	const char *skip_str = NULL;
 	int opt_max_backoff = 1800, opt_min_delay = 5, opt_initial_delay = 10;
 	char **urls = NULL;
@@ -1664,8 +1682,8 @@ int main(int argc, char **argv)
 			browse = true;
 		} else if (is_arg(a, "--fix") || is_arg(a, "-f")) {
 			fix = true;
-		} else if (is_arg(a, "--fix-full") || is_arg(a, "-F")) {
-			fix_full = true;
+		} else if (is_arg(a, "--full") || is_arg(a, "-F")) {
+			full_mode = true;
 		} else if (is_arg(a, "--haiku")) {
 			model = "claude-haiku-4-5";
 		} else if (is_arg(a, "--sonnet")) {
@@ -1700,7 +1718,7 @@ int main(int argc, char **argv)
 			       "  --browse            Browse the transcript database\n"
 			       "  --fix [URL ...]     Fill in missing fields (raw_only respected).\n"
 			       "                      URLs/channels scope the operation.\n"
-			       "  --fix-full [URL ...] Like --fix, but promotes raw-only videos to\n"
+			       "  --full [URL ...] Like --fix, but promotes raw-only videos to\n"
 			       "                      full summaries. Respects --no-summary.\n"
 			       "  --haiku             Use claude-haiku-4-5\n"
 			       "  --sonnet            Use claude-sonnet-4-6\n"
@@ -1734,11 +1752,11 @@ int main(int argc, char **argv)
 	free(xdg);
 
 	/* no arguments at all: default to browse */
-	if (!fix && !fix_full && !browse && nurls < 1)
+	if (!fix && !full_mode && !browse && nurls < 1)
 		browse = true;
 
 	/* browse-only: no URLs to process, go straight to the browser */
-	if (browse && !fix && !fix_full && nurls < 1) {
+	if (browse && !fix && !full_mode && nurls < 1) {
 		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos", (char *)NULL);
 		perror("browse-sqlite3");
 		return 1;
@@ -1793,7 +1811,7 @@ int main(int argc, char **argv)
 	Backoff bo;
 	backoff_init(&bo, opt_min_delay, opt_max_backoff, opt_initial_delay, 3, 2);
 
-	if (fix || fix_full) {
+	if (fix || full_mode) {
 		/* Two queues:
 		 *   Full queue  — raw_only=0/NULL videos with any gap. Run with
 		 *                 no_summary=false so missing summaries get filled.
@@ -1801,7 +1819,7 @@ int main(int argc, char **argv)
 		 *                 transcript only (summary fields are expected to
 		 *                 be empty). Run with no_summary=true to preserve
 		 *                 raw_only and skip Claude calls.
-		 *   --fix-full  — single queue over everything, no_summary=false,
+		 *   --full  — single queue over everything, no_summary=false,
 		 *                 promoting raw_only videos to full summaries.
 		 *
 		 * URLs (video URLs/IDs and channel URLs) scope the operation:
@@ -1856,7 +1874,7 @@ int main(int argc, char **argv)
 		queue_init(&fullq);
 		queue_init(&rawq);
 
-		const char *full_pred = fix_full
+		const char *full_pred = full_mode
 			? ""
 			: "(raw_only IS NULL OR raw_only = 0) AND ";
 		char *full_sql;
@@ -1884,8 +1902,8 @@ int main(int argc, char **argv)
 		sqlite3_finalize(st);
 		free(full_sql);
 
-		/* Raw-only queue: only populated for plain --fix (not --fix-full). */
-		if (!fix_full) {
+		/* Raw-only queue: only populated for plain --fix (not --full). */
+		if (!full_mode) {
 			char *raw_sql;
 			if (asprintf(&raw_sql,
 				"SELECT video_id FROM videos WHERE raw_only = 1 AND "
@@ -2007,7 +2025,7 @@ int main(int argc, char **argv)
 		free(fc);
 	}
 
-	if (!fix && !fix_full && nurls > 0) {
+	if (!fix && !full_mode && nurls > 0) {
 		/* Separate channel URLs from video URLs */
 		char **chan_urls = NULL;
 		int nchans = 0;
