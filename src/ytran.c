@@ -1142,6 +1142,44 @@ static void db_init(sqlite3 *db)
 		"INSERT OR IGNORE INTO _browse_config (key, value) "
 		"VALUES ('row_sort:videos', '[[\"updated_at\",\"DESC\"]]')",
 		NULL, NULL, NULL);
+	sqlite3_exec(db,
+		"INSERT OR IGNORE INTO _browse_config (key, value) "
+		"VALUES ('row_sort:videos_done', '[[\"updated_at\",\"DESC\"]]')",
+		NULL, NULL, NULL);
+
+	/* View: videos with bulk-downloaded unsummarized entries filtered out,
+	 * and channel_id replaced by the resolved channel name. */
+	sqlite3_exec(db,
+		"DROP VIEW IF EXISTS videos_done", NULL, NULL, NULL);
+	sqlite3_exec(db,
+		"CREATE VIEW videos_done AS "
+		"SELECT "
+		"  v.video_id,"
+		"  v.title,"
+		"  v.upload_date,"
+		"  v.duration,"
+		"  v.language,"
+		"  v.fetched_at,"
+		"  v.transcript_formatted,"
+		"  v.summary_short,"
+		"  v.summary_full,"
+		"  COALESCE("
+		"    (SELECT name FROM channel_names cn "
+		"     WHERE cn.channel_id = v.channel_id AND cn.name_type = 'fullname' LIMIT 1),"
+		"    (SELECT name FROM channel_names cn "
+		"     WHERE cn.channel_id = v.channel_id AND cn.name_type = 'handle' LIMIT 1),"
+		"    v.channel_id"
+		"  ) AS channel,"
+		"  v.description,"
+		"  v.raw_transcript,"
+		"  v.raw_only,"
+		"  v.updated_at "
+		"FROM videos v "
+		"LEFT JOIN channels c ON v.channel_id = c.channel_id "
+		"WHERE NOT (c.bulkdl = 1 "
+		"           AND v.summary_full IS NULL "
+		"           AND v.summary_short IS NULL)",
+		NULL, NULL, NULL);
 
 	/* Drop vestigial transcript column */
 	sqlite3_exec(db, "ALTER TABLE videos DROP COLUMN transcript", NULL, NULL, NULL);
@@ -1757,7 +1795,7 @@ int main(int argc, char **argv)
 
 	/* browse-only: no URLs to process, go straight to the browser */
 	if (browse && !fix && !full_mode && nurls < 1) {
-		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos", (char *)NULL);
+		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos_done", (char *)NULL);
 		perror("browse-sqlite3");
 		return 1;
 	}
@@ -2130,7 +2168,7 @@ int main(int argc, char **argv)
 		printf("Total API cost: $%.4f\n", total_cost);
 	printf("Database updated: %s\n", db_file);
 	if (browse) {
-		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos", (char *)NULL);
+		execlp("browse-sqlite3", "browse-sqlite3", db_file, "videos_done", (char *)NULL);
 		perror("browse-sqlite3");
 		return 1;
 	}
