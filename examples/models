@@ -1,0 +1,43 @@
+# ytran model definitions — one [section] per model.
+# Section names are what --pro, --sonnet, default=, etc. refer to.
+# Install to ~/.config/ytran/models to customize.
+
+[pro]
+name = deepseek-v4-pro
+endpoint = https://api.deepseek.com/anthropic/v1/messages
+api_key_file = .deepseek_api_key
+input_price = 0.55
+cache_write_price = 0.55
+cache_read_price = 0.14
+output_price = 2.19
+
+[flash]
+name = deepseek-v4-flash
+endpoint = https://api.deepseek.com/anthropic/v1/messages
+api_key_file = .deepseek_api_key
+input_price = 0.27
+output_price = 1.10
+
+[fable]
+name = claude-fable-5
+api_key_file = .anthropic_api_key
+input_price = 3.0
+output_price = 15.0
+
+[sonnet]
+name = claude-sonnet-4-6
+api_key_file = .anthropic_api_key
+input_price = 3.0
+output_price = 15.0
+
+[haiku]
+name = claude-haiku-4-5
+api_key_file = .anthropic_api_key
+input_price = 1.0
+output_price = 5.0
+
+[opus]
+name = claude-opus-4-8
+api_key_file = .anthropic_api_key
+input_price = 5.0
+output_price = 25.0

@@ -997,6 +997,11 @@ static void load_models_file(void)
 	char path[512];
 	snprintf(path, sizeof(path), "%s/models", config_dir());
 	FILE *f = fopen(path, "r");
+	if (!f) {
+		/* Fall back to system-installed models file */
+		snprintf(path, sizeof(path), "%s/share/ytran/models", PREFIX);
+		f = fopen(path, "r");
+	}
 	if (!f) return;
 
 	struct model_config *cur = NULL;
@@ -2001,35 +2006,14 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Read main config ($XDG_CONFIG_HOME/ytran/config) — just "default = <section>" */
-	char *home = getenv("HOME");
-	char path[512];
+	/* Read default model from $XDG_CONFIG_HOME/ytran/default (just a shortname) */
 	if (!model_from_cli) {
 		char cfg_path[512];
-		snprintf(cfg_path, sizeof(cfg_path), "%s/config", config_dir());
-		FILE *f = fopen(cfg_path, "r");
-		if (f) {
-			char line[256];
-			while (fgets(line, sizeof(line), f)) {
-				char *p = trim_line(line);
-				if (*p == '#' || *p == '\0') continue;
-				char *eq = strchr(p, '=');
-				if (!eq) continue;
-				*eq = '\0';
-				char *key = trim_line(p);
-				char *ke = key + strlen(key) - 1;
-				while (ke > key && (*ke == ' ' || *ke == '\t')) *(ke--) = '\0';
-				if (strcmp(key, "default") == 0) {
-					char *val = trim_line(eq + 1);
-					struct model_config *mc = find_model(val);
-					if (mc && mc->name)
-						model = mc->name;
-					else
-						model = strdup(val);
-					break;
-				}
-			}
-			fclose(f);
+		snprintf(cfg_path, sizeof(cfg_path), "%s/default", config_dir());
+		char *def = read_file_trimmed(cfg_path);
+		if (def) {
+			struct model_config *mc = find_model(def);
+			model = (mc && mc->name) ? mc->name : def;
 		}
 	}
 
@@ -2062,6 +2046,8 @@ int main(int argc, char **argv)
 	}
 
 	/* Read API keys */
+	char *home = getenv("HOME");
+	char path[512];
 	snprintf(path, sizeof(path), "%s/.youtubetotranscript_api_key", home);
 	transcript_api_key = read_file_trimmed(path);
 	snprintf(path, sizeof(path), "%s/.anthropic_api_key", home);

@@ -30,18 +30,17 @@ Configuration lives in
 .I $XDG_CONFIG_HOME/ytran/
 (default
 .IR ~/.config/ytran/ ).
-.SS Main config
+.SS Default model
 .PP
-.I ~/.config/ytran/config
-sets the default model:
+.I ~/.config/ytran/default
+contains a single shortname (a section name from the models file):
 .PP
 .RS
 .nf
-\fBdefault = pro\fR
+\fBpro\fR
 .fi
 .RE
 .PP
-The value is a section name from the models file (see below).
 If absent, the compiled default
 .RB ( claude-sonnet-4-6 )
 is used.
@@ -244,9 +243,9 @@ DeepSeek API key (used when model starts with
 Anthropic API key (used when model starts with
 .BR claude- ).
 .TP
-.I ~/.config/ytran/config
-Sets the default model
-.RI ( "default = pro" ).
+.I ~/.config/ytran/default
+Contains the default model shortname (e.g.,
+.BR pro ).
 .TP
 .I ~/.config/ytran/models
 INI-style model definitions (endpoint, key, pricing per model).

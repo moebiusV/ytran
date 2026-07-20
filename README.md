@@ -27,9 +27,9 @@ Model settings live in `$XDG_CONFIG_HOME/ytran/` (defaults to `~/.config/ytran/`
 
 ### Default model
 
-`~/.config/ytran/config` sets the default model:
-```ini
-default = pro
+`~/.config/ytran/default` contains a single shortname:
+```
+pro
 ```
 
 If absent, the compiled default (`claude-sonnet-4-6`) is used.

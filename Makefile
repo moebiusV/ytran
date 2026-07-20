@@ -1,15 +1,15 @@
-PREFIX = @PREFIX@
-CC = @CC@
-CFLAGS = @CFLAGS@ -std=c17
-LDFLAGS = @LDFLAGS@
-CPPFLAGS = @CPPFLAGS@
-CJSON_SRC = @CJSON_SRC@
-CJSON_CFLAGS = @CJSON_CFLAGS@
-CJSON_LIBS = @CJSON_LIBS@
-CURL_CFLAGS = @CURL_CFLAGS@
-CURL_LIBS = @CURL_LIBS@
-SQLITE_CFLAGS = @SQLITE_CFLAGS@
-SQLITE_LIBS = @SQLITE_LIBS@
+PREFIX = /usr/local
+CC = cc
+CFLAGS = -O2 -Wall -Wextra -std=c17
+LDFLAGS = 
+CPPFLAGS = 
+CJSON_SRC = 
+CJSON_CFLAGS = -I/usr/include/cjson 
+CJSON_LIBS = -lcjson 
+CURL_CFLAGS = -I/usr/include/x86_64-linux-gnu -I/usr/local/include -isystem /usr/include/mit-krb5 -I/usr/include/p11-kit-1 
+CURL_LIBS = -lcurl 
+SQLITE_CFLAGS = 
+SQLITE_LIBS = -lsqlite3 
 BINDIR = $(PREFIX)/bin
 MANDIR = $(PREFIX)/share/man/man1
 DATADIR = $(PREFIX)/share/ytran
@@ -51,13 +51,13 @@ check: src/ytran
 	@echo "All checks passed."
 
 dist:
-	rm -rf ytran-1.1
-	mkdir -p ytran-1.1/src/deps/cjson ytran-1.1/contrib
-	cp configure Makefile.in requirements.txt ytran-1.1/
-	cp contrib/ytran.py ytran-1.1/contrib/
-	cp src/ytran.c ytran-1.1/src/
-	cp src/deps/cjson/cJSON.c src/deps/cjson/cJSON.h ytran-1.1/src/deps/cjson/
-	cp README.md COPYING AUTHORS NEWS ChangeLog INSTALL ytran.1 examples/default examples/models ytran-1.1/
-	tar czf ytran-1.1.tar.gz ytran-1.1
-	rm -rf ytran-1.1
-	@echo "Created ytran-1.1.tar.gz"
+	rm -rf ytran-1.0
+	mkdir -p ytran-1.0/src/deps/cjson ytran-1.0/contrib
+	cp configure Makefile.in requirements.txt ytran-1.0/
+	cp contrib/ytran.py ytran-1.0/contrib/
+	cp src/ytran.c ytran-1.0/src/
+	cp src/deps/cjson/cJSON.c src/deps/cjson/cJSON.h ytran-1.0/src/deps/cjson/
+	cp README.md COPYING AUTHORS NEWS ChangeLog INSTALL ytran.1 examples/default examples/models ytran-1.0/
+	tar czf ytran-1.0.tar.gz ytran-1.0
+	rm -rf ytran-1.0
+	@echo "Created ytran-1.0.tar.gz"
