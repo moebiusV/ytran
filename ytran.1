@@ -12,7 +12,7 @@ ytran \- fetch and summarize YouTube video transcripts
 .SH DESCRIPTION
 .B ytran
 fetches YouTube video transcripts via transcriptapi.com, formats them
-with Claude, generates summaries, and stores everything in a local
+with Claude or DeepSeek, generates summaries, and stores everything in a local
 SQLite database.
 .PP
 When given a channel URL (containing \fB/@\fR, \fB/channel/\fR, \fB/c/\fR,
@@ -71,27 +71,54 @@ Default: 5.
 Starting delay between requests in batch modes.
 Default: 10.
 .TP
+.B \-\-opus
+Use claude-opus-4-8 for formatting and summarization.
+Shorthand for
+.BR "\-\-model claude-opus-4-8" .
+.TP
+.B \-\-fable
+Use claude-fable-5 for formatting and summarization.
+Shorthand for
+.BR "\-\-model claude-fable-5" .
+.TP
 .B \-\-haiku
 Use claude-haiku-4-5 for formatting and summarization.
 Shorthand for
 .BR "\-\-model claude-haiku-4-5" .
 .TP
 .B \-\-sonnet
-Use claude-sonnet-4-6 for formatting and summarization (default).
+Use claude-sonnet-4-6 for formatting and summarization.
 Shorthand for
 .BR "\-\-model claude-sonnet-4-6" .
 .TP
+.B \-\-flash
+Use deepseek-v4-flash for formatting and summarization.
+Shorthand for
+.BR "\-\-model deepseek-v4-flash" .
+.TP
+.B \-\-pro
+Use deepseek-v4-pro for formatting and summarization (default).
+Shorthand for
+.BR "\-\-model deepseek-v4-pro" .
+.TP
 .BI \-\-model " MODEL"
-Claude model to use for formatting and summarization.
-Default: claude-sonnet-4-6.
+Model to use for formatting and summarization.
+Default: deepseek-v4-pro.
+.TP
+.BI \-\-api-key " FILE"
+Override the API key file (default is auto-detected from model:
+.B ~/.deepseek_api_key
+for DeepSeek models,
+.B ~/.anthropic_api_key
+for Claude models).
 .TP
 .BR \-n ", " \-\-no\-summary
 Fetch metadata and raw transcript only; do not format or summarize
-with Claude.
+with Claude or DeepSeek.
 The entry is flagged as raw\-only so that future
 .B \-\-fix
 runs leave it alone.
-Does not require an Anthropic API key.
+Does not require an API key.
 .TP
 .BI \-\-skip " ID1,ID2,..."
 Comma-separated list of video IDs to skip during batch operations
@@ -139,8 +166,16 @@ Default database location (respects $XDG_DATA_HOME).
 .I ~/.youtubetotranscript_api_key
 transcriptapi.com bearer token.
 .TP
+.I ~/.deepseek_api_key
+DeepSeek API key (used when model starts with
+.BR deepseek- ).
+.TP
 .I ~/.anthropic_api_key
-Anthropic API key for Claude.
+Anthropic API key (used when model starts with
+.BR claude- ).
+.TP
+.BI \-\-api-key " FILE"
+Overrides auto-detection; use this file for any model.
 .SH DATABASE
 The database at
 .I ~/.local/share/ytran/youtube-transcripts.db

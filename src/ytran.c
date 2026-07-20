@@ -45,10 +45,14 @@ typedef struct {
 /* ── Pricing ($/MTok): input, cache_write, cache_read, output ── */
 
 static const struct { const char *model; double pi, pcw, pcr, po; } pricing[] = {
+	{"deepseek-v4-pro",   0.55, 0.55, 0.14, 2.19},
+	{"deepseek-v4-flash", 0.27, 0.27, 0.07, 1.10},
+	{"claude-opus-4-8",   5.0, 6.25, 0.50, 25.0},
 	{"claude-opus-4-6",   5.0, 6.25, 0.50, 25.0},
 	{"claude-sonnet-4-6", 3.0, 3.75, 0.30, 15.0},
 	{"claude-haiku-4-5",  1.0, 1.25, 0.10,  5.0},
-	{NULL, 5.0, 6.25, 0.50, 25.0}
+	{"claude-fable-5",    5.0, 6.25, 0.50, 25.0},
+	{NULL, 0.55, 0.55, 0.14, 2.19}
 };
 
 /* ── Globals ── */
@@ -57,7 +61,9 @@ static double total_cost;
 static double g_last_cost;  /* cost of most recent API call */
 static char *transcript_api_key;
 static char *anthropic_api_key;
-static const char *model = "claude-sonnet-4-6";
+static char *deepseek_api_key;
+static const char *api_key_file = NULL;
+static const char *model = "deepseek-v4-pro";
 
 /* ── Buffer ── */
 
@@ -947,6 +953,30 @@ static size_t stream_write_cb(void *ptr, size_t size, size_t nmemb, void *ud)
 	return total;
 }
 
+static const char *llm_endpoint(const char *model)
+{
+	if (strncmp(model, "deepseek-", 9) == 0)
+		return "https://api.deepseek.com/anthropic/v1/messages";
+	return "https://api.anthropic.com/v1/messages";
+}
+
+static const char *llm_key(const char *model)
+{
+	if (api_key_file) {
+		/* --api-key overrides auto-detection: read on demand */
+		static char *override_key;
+		if (!override_key) {
+			char buf[512];
+			snprintf(buf, sizeof(buf), "%s/%s", getenv("HOME"), api_key_file);
+			override_key = read_file_trimmed(buf);
+		}
+		return override_key;
+	}
+	if (strncmp(model, "deepseek-", 9) == 0)
+		return deepseek_api_key;
+	return anthropic_api_key;
+}
+
 static char *generate_with_claude(const char *prompt, const char *cached_prefix,
                                   const char *model, int max_tokens)
 {
@@ -978,7 +1008,12 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 
 	/* HTTP headers */
 	char auth_hdr[256];
-	snprintf(auth_hdr, sizeof(auth_hdr), "x-api-key: %s", anthropic_api_key);
+	const char *apikey = llm_key(model);
+	if (!apikey) {
+		cJSON_Delete(req);
+		return NULL;
+	}
+	snprintf(auth_hdr, sizeof(auth_hdr), "x-api-key: %s", apikey);
 	struct curl_slist *headers = NULL;
 	headers = curl_slist_append(headers, auth_hdr);
 	headers = curl_slist_append(headers, "anthropic-version: 2023-06-01");
@@ -990,7 +1025,7 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 	stream_init(&ctx);
 
 	CURL *c = curl_easy_init();
-	curl_easy_setopt(c, CURLOPT_URL, "https://api.anthropic.com/v1/messages");
+	curl_easy_setopt(c, CURLOPT_URL, llm_endpoint(model));
 	curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, stream_write_cb);
 	curl_easy_setopt(c, CURLOPT_WRITEDATA, &ctx);
 	curl_easy_setopt(c, CURLOPT_HTTPHEADER, headers);
@@ -1726,14 +1761,26 @@ int main(int argc, char **argv)
 			fix = true;
 		} else if (is_arg(a, "--full") || is_arg(a, "-F")) {
 			full_mode = true;
+		} else if (is_arg(a, "--opus")) {
+			model = "claude-opus-4-8";
+		} else if (is_arg(a, "--fable")) {
+			model = "claude-fable-5";
 		} else if (is_arg(a, "--haiku")) {
 			model = "claude-haiku-4-5";
 		} else if (is_arg(a, "--sonnet")) {
 			model = "claude-sonnet-4-6";
+		} else if (is_arg(a, "--flash")) {
+			model = "deepseek-v4-flash";
+		} else if (is_arg(a, "--pro")) {
+			model = "deepseek-v4-pro";
 		} else if (is_arg(a, "--model") || is_arg(a, "-m")) {
 			if (++i < argc) model = argv[i];
 		} else if ((v = is_arg_val(a, "--model"))) {
 			model = v;
+		} else if (is_arg(a, "--api-key") || is_arg(a, "-k")) {
+			if (++i < argc) api_key_file = argv[i];
+		} else if ((v = is_arg_val(a, "--api-key"))) {
+			api_key_file = v;
 		} else if (is_arg(a, "--skip") || is_arg(a, "-s")) {
 			if (++i < argc) skip_str = argv[i];
 		} else if ((v = is_arg_val(a, "--skip"))) {
@@ -1762,9 +1809,14 @@ int main(int argc, char **argv)
 			       "                      URLs/channels scope the operation.\n"
 			       "  --full [URL ...] Like --fix, but promotes raw-only videos to\n"
 			       "                      full summaries. Respects --no-summary.\n"
+			       "  --opus              Use claude-opus-4-8\n"
+			       "  --fable             Use claude-fable-5\n"
 			       "  --haiku             Use claude-haiku-4-5\n"
 			       "  --sonnet            Use claude-sonnet-4-6\n"
-			       "  --model MODEL       Claude model [%s]\n"
+			       "  --flash             Use deepseek-v4-flash\n"
+			       "  --pro               Use deepseek-v4-pro\n"
+			       "  --model MODEL       Model name [%s]\n"
+			       "  --api-key FILE      Override API key file (auto: model prefix)\n"
 			       "  --no-summary        Fetch metadata and transcript only\n"
 			       "  --skip IDs          Comma-separated video IDs to skip\n"
 			       "  --max-backoff SECS  Backoff ceiling for batch modes [1800]\n"
@@ -1818,15 +1870,32 @@ int main(int argc, char **argv)
 	transcript_api_key = read_file_trimmed(path);
 	snprintf(path, sizeof(path), "%s/.anthropic_api_key", home);
 	anthropic_api_key = read_file_trimmed(path);
+	snprintf(path, sizeof(path), "%s/.deepseek_api_key", home);
+	deepseek_api_key = read_file_trimmed(path);
 	if (!transcript_api_key) {
 		fprintf(stderr, "Error: %s/.youtubetotranscript_api_key not found\n", home);
 		fprintf(stderr, "Get a key at https://transcriptapi.com and save it to that file.\n");
 		return 1;
 	}
-	if (!anthropic_api_key && !no_summary) {
-		fprintf(stderr, "Error: %s/.anthropic_api_key not found\n", home);
-		fprintf(stderr, "Get a key at https://console.anthropic.com/settings/keys and save it to that file.\n");
-		return 1;
+	if (!no_summary) {
+		const char *k = api_key_file ? NULL :  /* checked post-read below */
+			(strncmp(model, "deepseek-", 9) == 0 ? deepseek_api_key : anthropic_api_key);
+		if (api_key_file) {
+			char buf[512];
+			snprintf(buf, sizeof(buf), "%s/%s", home, api_key_file);
+			k = read_file_trimmed(buf);
+			if (!k) {
+				fprintf(stderr, "Error: %s not found\n", buf);
+				return 1;
+			}
+		}
+		if (!k) {
+			const char *want = strncmp(model, "deepseek-", 9) == 0
+				? "~/.deepseek_api_key" : "~/.anthropic_api_key";
+			fprintf(stderr, "Error: %s not found (model %s requires it)\n", want, model);
+			fprintf(stderr, "Use --api-key FILE to specify a key file.\n");
+			return 1;
+		}
 	}
 
 	/* Create DB directory and open */
@@ -2189,6 +2258,7 @@ int main(int argc, char **argv)
 	free(skip_ids);
 	free(transcript_api_key);
 	free(anthropic_api_key);
+	free(deepseek_api_key);
 	free(urls);
 	return 0;
 }
