@@ -62,8 +62,12 @@ static double g_last_cost;  /* cost of most recent API call */
 static char *transcript_api_key;
 static char *anthropic_api_key;
 static char *deepseek_api_key;
-static const char *api_key_file = NULL;
-static const char *model = "deepseek-v4-pro";
+static const char *api_key_file = NULL;     /* --api-key CLI flag */
+static const char *config_endpoint = NULL;  /* endpoint from config file */
+static const char *config_api_key = NULL;   /* raw key from config file */
+static bool model_from_cli = false;
+static bool api_key_from_cli = false;
+static const char *model = "claude-sonnet-4-6";
 
 /* ── Buffer ── */
 
@@ -955,6 +959,8 @@ static size_t stream_write_cb(void *ptr, size_t size, size_t nmemb, void *ud)
 
 static const char *llm_endpoint(const char *model)
 {
+	if (config_endpoint)
+		return config_endpoint;
 	if (strncmp(model, "deepseek-", 9) == 0)
 		return "https://api.deepseek.com/anthropic/v1/messages";
 	return "https://api.anthropic.com/v1/messages";
@@ -962,16 +968,23 @@ static const char *llm_endpoint(const char *model)
 
 static const char *llm_key(const char *model)
 {
+	/* 1. CLI --api-key FILE (overrides everything) */
 	if (api_key_file) {
-		/* --api-key overrides auto-detection: read on demand */
 		static char *override_key;
 		if (!override_key) {
-			char buf[512];
-			snprintf(buf, sizeof(buf), "%s/%s", getenv("HOME"), api_key_file);
+			char buf[512], *home = getenv("HOME");
+			if (api_key_file[0] == '/')
+				snprintf(buf, sizeof(buf), "%s", api_key_file);
+			else
+				snprintf(buf, sizeof(buf), "%s/%s", home, api_key_file);
 			override_key = read_file_trimmed(buf);
 		}
 		return override_key;
 	}
+	/* 2. Config api_key = sk-xxx (raw key) */
+	if (config_api_key)
+		return config_api_key;
+	/* 3. Auto-detect from model prefix */
 	if (strncmp(model, "deepseek-", 9) == 0)
 		return deepseek_api_key;
 	return anthropic_api_key;
@@ -1762,25 +1775,25 @@ int main(int argc, char **argv)
 		} else if (is_arg(a, "--full") || is_arg(a, "-F")) {
 			full_mode = true;
 		} else if (is_arg(a, "--opus")) {
-			model = "claude-opus-4-8";
+			model = "claude-opus-4-8"; model_from_cli = true;
 		} else if (is_arg(a, "--fable")) {
-			model = "claude-fable-5";
+			model = "claude-fable-5"; model_from_cli = true;
 		} else if (is_arg(a, "--haiku")) {
-			model = "claude-haiku-4-5";
+			model = "claude-haiku-4-5"; model_from_cli = true;
 		} else if (is_arg(a, "--sonnet")) {
-			model = "claude-sonnet-4-6";
+			model = "claude-sonnet-4-6"; model_from_cli = true;
 		} else if (is_arg(a, "--flash")) {
-			model = "deepseek-v4-flash";
+			model = "deepseek-v4-flash"; model_from_cli = true;
 		} else if (is_arg(a, "--pro")) {
-			model = "deepseek-v4-pro";
+			model = "deepseek-v4-pro"; model_from_cli = true;
 		} else if (is_arg(a, "--model") || is_arg(a, "-m")) {
-			if (++i < argc) model = argv[i];
+			if (++i < argc) { model = argv[i]; model_from_cli = true; }
 		} else if ((v = is_arg_val(a, "--model"))) {
-			model = v;
+			model = v; model_from_cli = true;
 		} else if (is_arg(a, "--api-key") || is_arg(a, "-k")) {
-			if (++i < argc) api_key_file = argv[i];
+			if (++i < argc) { api_key_file = argv[i]; api_key_from_cli = true; }
 		} else if ((v = is_arg_val(a, "--api-key"))) {
-			api_key_file = v;
+			api_key_file = v; api_key_from_cli = true;
 		} else if (is_arg(a, "--skip") || is_arg(a, "-s")) {
 			if (++i < argc) skip_str = argv[i];
 		} else if ((v = is_arg_val(a, "--skip"))) {
@@ -1835,6 +1848,47 @@ int main(int argc, char **argv)
 		}
 	}
 
+	/* Read config file ($XDG_CONFIG_HOME/ytran/config) — CLI flags take precedence */
+	char *home = getenv("HOME");
+	char path[512];
+	{
+		const char *cfg = getenv("XDG_CONFIG_HOME");
+		char cfg_path[512];
+		if (cfg && *cfg)
+			snprintf(cfg_path, sizeof(cfg_path), "%s/ytran/config", cfg);
+		else
+			snprintf(cfg_path, sizeof(cfg_path), "%s/.config/ytran/config", home);
+		FILE *f = fopen(cfg_path, "r");
+		if (f) {
+			char line[256];
+			while (fgets(line, sizeof(line), f)) {
+				char *p = line;
+				while (*p == ' ' || *p == '\t') p++;  /* trim left */
+				if (*p == '#' || *p == '\n' || *p == '\0') continue;
+				char *eq = strchr(p, '=');
+				if (!eq) continue;
+				char *key_end = eq - 1;
+				while (key_end > p && (*key_end == ' ' || *key_end == '\t')) key_end--;
+				*(key_end + 1) = '\0';
+				char *val = eq + 1;
+				while (*val == ' ' || *val == '\t') val++;
+				char *val_end = val + strlen(val) - 1;
+				while (val_end >= val && (*val_end == '\n' || *val_end == '\r'
+					|| *val_end == ' ' || *val_end == '\t'))
+					*(val_end--) = '\0';
+				if (strcmp(p, "model") == 0 && !model_from_cli)
+					model = strdup(val);
+				else if (strcmp(p, "endpoint") == 0)
+					config_endpoint = strdup(val);
+				else if (strcmp(p, "api_key") == 0 && !api_key_from_cli)
+					config_api_key = strdup(val);
+				else if (strcmp(p, "api_key_file") == 0 && !api_key_from_cli)
+					api_key_file = strdup(val);
+			}
+			fclose(f);
+		}
+	}
+
 	/* Build DB path */
 	char *xdg = xdg_data_home();
 	char *db_dir = NULL, *db_file = NULL;
@@ -1864,8 +1918,6 @@ int main(int argc, char **argv)
 	}
 
 	/* Read API keys */
-	char *home = getenv("HOME");
-	char path[512];
 	snprintf(path, sizeof(path), "%s/.youtubetotranscript_api_key", home);
 	transcript_api_key = read_file_trimmed(path);
 	snprintf(path, sizeof(path), "%s/.anthropic_api_key", home);
@@ -1878,23 +1930,39 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (!no_summary) {
-		const char *k = api_key_file ? NULL :  /* checked post-read below */
-			(strncmp(model, "deepseek-", 9) == 0 ? deepseek_api_key : anthropic_api_key);
-		if (api_key_file) {
-			char buf[512];
-			snprintf(buf, sizeof(buf), "%s/%s", home, api_key_file);
-			k = read_file_trimmed(buf);
-			if (!k) {
-				fprintf(stderr, "Error: %s not found\n", buf);
-				return 1;
+		/* Key resolution, in precedence order:
+		   1. --api-key FILE  -> api_key_file
+		   2. config api_key = sk-xxx  -> config_api_key
+		   3. config api_key_file = path
+		   4. auto-detect from model prefix */
+		if (!api_key_file && !config_api_key) {
+			const char *kf = api_key_file;  /* may be set from config */
+			if (!kf) {
+				kf = strncmp(model, "deepseek-", 9) == 0
+					? "~/.deepseek_api_key" : "~/.anthropic_api_key";
+				/* auto-detected keys already read above, just check they exist */
+				const char *k = strncmp(model, "deepseek-", 9) == 0
+					? deepseek_api_key : anthropic_api_key;
+				if (!k) {
+					fprintf(stderr, "Error: %s not found (model %s requires it)\n", kf, model);
+					fprintf(stderr, "Use --api-key FILE or set api_key/api_key_file in ~/.config/ytran/config\n");
+					return 1;
+				}
 			}
-		}
-		if (!k) {
-			const char *want = strncmp(model, "deepseek-", 9) == 0
-				? "~/.deepseek_api_key" : "~/.anthropic_api_key";
-			fprintf(stderr, "Error: %s not found (model %s requires it)\n", want, model);
-			fprintf(stderr, "Use --api-key FILE to specify a key file.\n");
-			return 1;
+			/* api_key_file from config: verify it exists */
+			if (api_key_file) {
+				char buf[512];
+				if (api_key_file[0] == '/')
+					snprintf(buf, sizeof(buf), "%s", api_key_file);
+				else
+					snprintf(buf, sizeof(buf), "%s/%s", home, api_key_file);
+				char *k = read_file_trimmed(buf);
+				if (!k) {
+					fprintf(stderr, "Error: %s not found\n", buf);
+					return 1;
+				}
+				free(k);
+			}
 		}
 	}
 

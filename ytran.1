@@ -24,6 +24,52 @@ automatic retry and exponential backoff.
 Multiple video URLs are also processed in batch mode with backoff.
 Failed downloads are re-queued at the back of the list (circular queue)
 and retried until 4 consecutive failures at the backoff ceiling.
+.SH CONFIGURATION
+.PP
+The file
+.I ~/.config/ytran/config
+(respects
+.BR $XDG_CONFIG_HOME )
+sets default model, endpoint, and API key.
+Format is simple
+.IR "key = value" ,
+one per line.
+Lines starting with
+.B #
+are comments.
+.PP
+Supported keys:
+.TP
+.B model
+Default model name (e.g.,
+.BR deepseek-v4-pro ).
+Overridden by
+.B \-\-model
+and model shortcut flags.
+.TP
+.B endpoint
+API endpoint URL.
+Auto-detected from model prefix if not set.
+.TP
+.B api_key
+Raw API key string (takes precedence over
+.BR api_key_file ).
+.TP
+.B api_key_file
+Path to a file containing the API key.
+Relative paths are resolved against
+.BR $HOME .
+.PP
+CLI flags override config file values.
+.PP
+Example (switch default to DeepSeek):
+.PP
+.RS
+.nf
+\fB# ~/.config/ytran/config
+model = deepseek-v4-pro\fR
+.fi
+.RE
 .SH OPTIONS
 .TP
 .BR \-b ", " \-\-browse
@@ -118,7 +164,7 @@ with Claude or DeepSeek.
 The entry is flagged as raw\-only so that future
 .B \-\-fix
 runs leave it alone.
-Does not require an API key.
+Does not require an LLM API key.
 .TP
 .BI \-\-skip " ID1,ID2,..."
 Comma-separated list of video IDs to skip during batch operations
@@ -174,8 +220,10 @@ DeepSeek API key (used when model starts with
 Anthropic API key (used when model starts with
 .BR claude- ).
 .TP
-.BI \-\-api-key " FILE"
-Overrides auto-detection; use this file for any model.
+.I ~/.config/ytran/config
+Configuration file (respects
+.BR $XDG_CONFIG_HOME ).
+Sets default model, endpoint, and API key.
 .SH DATABASE
 The database at
 .I ~/.local/share/ytran/youtube-transcripts.db
