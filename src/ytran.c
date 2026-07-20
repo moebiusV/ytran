@@ -42,9 +42,23 @@ typedef struct {
 	int backoff_mult, decrease;
 } Backoff;
 
-/* ── Pricing ($/MTok): input, cache_write, cache_read, output ── */
+/* ── Model configuration (loaded from ~/.config/ytran/models) ── */
 
-static const struct { const char *model; double pi, pcw, pcr, po; } pricing[] = {
+struct model_config {
+	char *section;       /* [pro] */
+	char *name;          /* deepseek-v4-pro */
+	char *endpoint;      /* API endpoint URL */
+	char *api_key;       /* raw key string */
+	char *api_key_file;  /* path to key file */
+	double pi, pcw, pcr, po;  /* pricing: input, cache_write, cache_read, output */
+	struct model_config *next;
+};
+
+static struct model_config *models = NULL;  /* linked list from models file */
+
+/* Compiled fallback pricing — used when model not found in config file.
+   ($/MTok): input, cache_write, cache_read, output */
+static const struct { const char *model; double pi, pcw, pcr, po; } builtin_pricing[] = {
 	{"deepseek-v4-pro",   0.55, 0.55, 0.14, 2.19},
 	{"deepseek-v4-flash", 0.27, 0.27, 0.07, 1.10},
 	{"claude-opus-4-8",   5.0, 6.25, 0.50, 25.0},
@@ -52,7 +66,7 @@ static const struct { const char *model; double pi, pcw, pcr, po; } pricing[] = 
 	{"claude-sonnet-4-6", 3.0, 3.75, 0.30, 15.0},
 	{"claude-haiku-4-5",  1.0, 1.25, 0.10,  5.0},
 	{"claude-fable-5",    5.0, 6.25, 0.50, 25.0},
-	{NULL, 0.55, 0.55, 0.14, 2.19}
+	{NULL, 0, 0, 0, 0}
 };
 
 /* ── Globals ── */
@@ -63,8 +77,6 @@ static char *transcript_api_key;
 static char *anthropic_api_key;
 static char *deepseek_api_key;
 static const char *api_key_file = NULL;     /* --api-key CLI flag */
-static const char *config_endpoint = NULL;  /* endpoint from config file */
-static const char *config_api_key = NULL;   /* raw key from config file */
 static bool model_from_cli = false;
 static bool api_key_from_cli = false;
 static const char *model = "claude-sonnet-4-6";
@@ -957,37 +969,165 @@ static size_t stream_write_cb(void *ptr, size_t size, size_t nmemb, void *ud)
 	return total;
 }
 
-static const char *llm_endpoint(const char *model)
+/* ── Model config file parser ── */
+
+static char *trim_line(char *s)
 {
-	if (config_endpoint)
-		return config_endpoint;
-	if (strncmp(model, "deepseek-", 9) == 0)
+	while (*s == ' ' || *s == '\t') s++;
+	char *end = s + strlen(s) - 1;
+	while (end >= s && (*end == '\n' || *end == '\r' || *end == ' ' || *end == '\t'))
+		*(end--) = '\0';
+	return s;
+}
+
+static char *config_dir(void)
+{
+	static char dir[512];
+	const char *xdg = getenv("XDG_CONFIG_HOME");
+	if (xdg && *xdg)
+		snprintf(dir, sizeof(dir), "%s/ytran", xdg);
+	else
+		snprintf(dir, sizeof(dir), "%s/.config/ytran", getenv("HOME"));
+	return dir;
+}
+
+static void load_models_file(void)
+{
+	if (models) return;  /* already loaded */
+	char path[512];
+	snprintf(path, sizeof(path), "%s/models", config_dir());
+	FILE *f = fopen(path, "r");
+	if (!f) return;
+
+	struct model_config *cur = NULL;
+	char line[512];
+	while (fgets(line, sizeof(line), f)) {
+		char *p = trim_line(line);
+		if (*p == '#' || *p == '\0') continue;
+		if (*p == '[') {
+			char *end = strchr(p + 1, ']');
+			if (!end) continue;
+			*end = '\0';
+			struct model_config *mc = calloc(1, sizeof(*mc));
+			mc->section = strdup(p + 1);
+			mc->next = models;
+			models = mc;
+			cur = mc;
+		} else if (cur) {
+			char *eq = strchr(p, '=');
+			if (!eq) continue;
+			*eq = '\0';
+			char *key = p;
+			char *val = trim_line(eq + 1);
+			/* trim trailing whitespace from key */
+			char *ke = key + strlen(key) - 1;
+			while (ke > key && (*ke == ' ' || *ke == '\t')) *(ke--) = '\0';
+			if (strcmp(key, "name") == 0)
+				cur->name = strdup(val);
+			else if (strcmp(key, "endpoint") == 0)
+				cur->endpoint = strdup(val);
+			else if (strcmp(key, "api_key") == 0)
+				cur->api_key = strdup(val);
+			else if (strcmp(key, "api_key_file") == 0)
+				cur->api_key_file = strdup(val);
+			else if (strcmp(key, "input_price") == 0)
+				cur->pi = atof(val);
+			else if (strcmp(key, "cache_write_price") == 0)
+				cur->pcw = atof(val);
+			else if (strcmp(key, "cache_read_price") == 0)
+				cur->pcr = atof(val);
+			else if (strcmp(key, "output_price") == 0)
+				cur->po = atof(val);
+		}
+	}
+	fclose(f);
+}
+
+static struct model_config *find_model(const char *section_or_name)
+{
+	load_models_file();
+	for (struct model_config *m = models; m; m = m->next) {
+		if (strcmp(m->section, section_or_name) == 0)
+			return m;
+		if (m->name && strcmp(m->name, section_or_name) == 0)
+			return m;
+	}
+	/* Fallback: try extracting short name from full model string */
+	if (strncmp(section_or_name, "deepseek-v4-", 12) == 0) {
+		return find_model(section_or_name + 12);  /* "pro" or "flash" */
+	} else if (strncmp(section_or_name, "claude-", 7) == 0) {
+		return find_model(section_or_name + 7);  /* "opus-4-8", "sonnet-4-6", etc. */
+	}
+	return NULL;
+}
+
+static const char *llm_endpoint(const char *mdl)
+{
+	struct model_config *mc = find_model(mdl);
+	if (mc && mc->endpoint) return mc->endpoint;
+	if (strncmp(mdl, "deepseek-", 9) == 0)
 		return "https://api.deepseek.com/anthropic/v1/messages";
 	return "https://api.anthropic.com/v1/messages";
 }
 
-static const char *llm_key(const char *model)
+static char *read_key_file(const char *fname)
 {
-	/* 1. CLI --api-key FILE (overrides everything) */
+	char buf[512], *home = getenv("HOME");
+	if (fname[0] == '/')
+		snprintf(buf, sizeof(buf), "%s", fname);
+	else
+		snprintf(buf, sizeof(buf), "%s/%s", home, fname);
+	return read_file_trimmed(buf);
+}
+
+static const char *llm_key(const char *mdl)
+{
+	/* 1. CLI --api-key FILE */
 	if (api_key_file) {
 		static char *override_key;
-		if (!override_key) {
-			char buf[512], *home = getenv("HOME");
-			if (api_key_file[0] == '/')
-				snprintf(buf, sizeof(buf), "%s", api_key_file);
-			else
-				snprintf(buf, sizeof(buf), "%s/%s", home, api_key_file);
-			override_key = read_file_trimmed(buf);
-		}
+		if (!override_key)
+			override_key = read_key_file(api_key_file);
 		return override_key;
 	}
-	/* 2. Config api_key = sk-xxx (raw key) */
-	if (config_api_key)
-		return config_api_key;
+	/* 2. Model config: api_key or api_key_file */
+	struct model_config *mc = find_model(mdl);
+	if (mc) {
+		if (mc->api_key) return mc->api_key;
+		if (mc->api_key_file) {
+			static char *mkey;
+			static char *mkey_for;
+			if (!mkey || strcmp(mkey_for, mc->api_key_file) != 0) {
+				free(mkey);
+				mkey = read_key_file(mc->api_key_file);
+				free(mkey_for);
+				mkey_for = strdup(mc->api_key_file);
+			}
+			return mkey;
+		}
+	}
 	/* 3. Auto-detect from model prefix */
-	if (strncmp(model, "deepseek-", 9) == 0)
+	if (strncmp(mdl, "deepseek-", 9) == 0)
 		return deepseek_api_key;
 	return anthropic_api_key;
+}
+
+static void lookup_pricing(const char *mdl, double *pi, double *pcw, double *pcr, double *po)
+{
+	struct model_config *mc = find_model(mdl);
+	if (mc && (mc->pi > 0 || mc->po > 0)) {
+		*pi = mc->pi; *pcw = mc->pcw; *pcr = mc->pcr; *po = mc->po;
+		return;
+	}
+	for (int i = 0; builtin_pricing[i].model; i++) {
+		if (strcmp(builtin_pricing[i].model, mdl) == 0) {
+			*pi = builtin_pricing[i].pi;
+			*pcw = builtin_pricing[i].pcw;
+			*pcr = builtin_pricing[i].pcr;
+			*po = builtin_pricing[i].po;
+			return;
+		}
+	}
+	*pi = *pcw = *pcr = *po = 0;
 }
 
 static char *generate_with_claude(const char *prompt, const char *cached_prefix,
@@ -1074,13 +1214,8 @@ static char *generate_with_claude(const char *prompt, const char *cached_prefix,
 			"%.63s", ctx.errmsg[0] ? ctx.errmsg : "stream error");
 
 	/* Cost tracking */
-	double pi = 5.0, pcw = 6.25, pcr = 0.50, po = 25.0;
-	for (int i = 0; pricing[i].model; i++)
-		if (strcmp(pricing[i].model, model) == 0) {
-			pi = pricing[i].pi; pcw = pricing[i].pcw;
-			pcr = pricing[i].pcr; po = pricing[i].po;
-			break;
-		}
+	double pi, pcw, pcr, po;
+	lookup_pricing(model, &pi, &pcw, &pcr, &po);
 	double cost = (ctx.in_tok * pi + ctx.cw_tok * pcw +
 	               ctx.cr_tok * pcr + ctx.out_tok * po) / 1e6;
 	total_cost += cost;
@@ -1775,21 +1910,39 @@ int main(int argc, char **argv)
 		} else if (is_arg(a, "--full") || is_arg(a, "-F")) {
 			full_mode = true;
 		} else if (is_arg(a, "--opus")) {
-			model = "claude-opus-4-8"; model_from_cli = true;
+			struct model_config *mc = find_model("opus");
+			model = (mc && mc->name) ? mc->name : "claude-opus-4-8";
+			model_from_cli = true;
 		} else if (is_arg(a, "--fable")) {
-			model = "claude-fable-5"; model_from_cli = true;
+			struct model_config *mc = find_model("fable");
+			model = (mc && mc->name) ? mc->name : "claude-fable-5";
+			model_from_cli = true;
 		} else if (is_arg(a, "--haiku")) {
-			model = "claude-haiku-4-5"; model_from_cli = true;
+			struct model_config *mc = find_model("haiku");
+			model = (mc && mc->name) ? mc->name : "claude-haiku-4-5";
+			model_from_cli = true;
 		} else if (is_arg(a, "--sonnet")) {
-			model = "claude-sonnet-4-6"; model_from_cli = true;
+			struct model_config *mc = find_model("sonnet");
+			model = (mc && mc->name) ? mc->name : "claude-sonnet-4-6";
+			model_from_cli = true;
 		} else if (is_arg(a, "--flash")) {
-			model = "deepseek-v4-flash"; model_from_cli = true;
+			struct model_config *mc = find_model("flash");
+			model = (mc && mc->name) ? mc->name : "deepseek-v4-flash";
+			model_from_cli = true;
 		} else if (is_arg(a, "--pro")) {
-			model = "deepseek-v4-pro"; model_from_cli = true;
+			struct model_config *mc = find_model("pro");
+			model = (mc && mc->name) ? mc->name : "deepseek-v4-pro";
+			model_from_cli = true;
 		} else if (is_arg(a, "--model") || is_arg(a, "-m")) {
-			if (++i < argc) { model = argv[i]; model_from_cli = true; }
+			if (++i < argc) {
+				struct model_config *mc = find_model(argv[i]);
+				model = (mc && mc->name) ? mc->name : argv[i];
+				model_from_cli = true;
+			}
 		} else if ((v = is_arg_val(a, "--model"))) {
-			model = v; model_from_cli = true;
+			struct model_config *mc = find_model(v);
+			model = (mc && mc->name) ? mc->name : v;
+			model_from_cli = true;
 		} else if (is_arg(a, "--api-key") || is_arg(a, "-k")) {
 			if (++i < argc) { api_key_file = argv[i]; api_key_from_cli = true; }
 		} else if ((v = is_arg_val(a, "--api-key"))) {
@@ -1848,42 +2001,33 @@ int main(int argc, char **argv)
 		}
 	}
 
-	/* Read config file ($XDG_CONFIG_HOME/ytran/config) — CLI flags take precedence */
+	/* Read main config ($XDG_CONFIG_HOME/ytran/config) — just "default = <section>" */
 	char *home = getenv("HOME");
 	char path[512];
-	{
-		const char *cfg = getenv("XDG_CONFIG_HOME");
+	if (!model_from_cli) {
 		char cfg_path[512];
-		if (cfg && *cfg)
-			snprintf(cfg_path, sizeof(cfg_path), "%s/ytran/config", cfg);
-		else
-			snprintf(cfg_path, sizeof(cfg_path), "%s/.config/ytran/config", home);
+		snprintf(cfg_path, sizeof(cfg_path), "%s/config", config_dir());
 		FILE *f = fopen(cfg_path, "r");
 		if (f) {
 			char line[256];
 			while (fgets(line, sizeof(line), f)) {
-				char *p = line;
-				while (*p == ' ' || *p == '\t') p++;  /* trim left */
-				if (*p == '#' || *p == '\n' || *p == '\0') continue;
+				char *p = trim_line(line);
+				if (*p == '#' || *p == '\0') continue;
 				char *eq = strchr(p, '=');
 				if (!eq) continue;
-				char *key_end = eq - 1;
-				while (key_end > p && (*key_end == ' ' || *key_end == '\t')) key_end--;
-				*(key_end + 1) = '\0';
-				char *val = eq + 1;
-				while (*val == ' ' || *val == '\t') val++;
-				char *val_end = val + strlen(val) - 1;
-				while (val_end >= val && (*val_end == '\n' || *val_end == '\r'
-					|| *val_end == ' ' || *val_end == '\t'))
-					*(val_end--) = '\0';
-				if (strcmp(p, "model") == 0 && !model_from_cli)
-					model = strdup(val);
-				else if (strcmp(p, "endpoint") == 0)
-					config_endpoint = strdup(val);
-				else if (strcmp(p, "api_key") == 0 && !api_key_from_cli)
-					config_api_key = strdup(val);
-				else if (strcmp(p, "api_key_file") == 0 && !api_key_from_cli)
-					api_key_file = strdup(val);
+				*eq = '\0';
+				char *key = trim_line(p);
+				char *ke = key + strlen(key) - 1;
+				while (ke > key && (*ke == ' ' || *ke == '\t')) *(ke--) = '\0';
+				if (strcmp(key, "default") == 0) {
+					char *val = trim_line(eq + 1);
+					struct model_config *mc = find_model(val);
+					if (mc && mc->name)
+						model = mc->name;
+					else
+						model = strdup(val);
+					break;
+				}
 			}
 			fclose(f);
 		}
@@ -1930,38 +2074,37 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	if (!no_summary) {
-		/* Key resolution, in precedence order:
-		   1. --api-key FILE  -> api_key_file
-		   2. config api_key = sk-xxx  -> config_api_key
-		   3. config api_key_file = path
-		   4. auto-detect from model prefix */
-		if (!api_key_file && !config_api_key) {
-			const char *kf = api_key_file;  /* may be set from config */
-			if (!kf) {
-				kf = strncmp(model, "deepseek-", 9) == 0
-					? "~/.deepseek_api_key" : "~/.anthropic_api_key";
-				/* auto-detected keys already read above, just check they exist */
-				const char *k = strncmp(model, "deepseek-", 9) == 0
-					? deepseek_api_key : anthropic_api_key;
-				if (!k) {
-					fprintf(stderr, "Error: %s not found (model %s requires it)\n", kf, model);
-					fprintf(stderr, "Use --api-key FILE or set api_key/api_key_file in ~/.config/ytran/config\n");
-					return 1;
-				}
+		/* Validate LLM key is available for selected model */
+		if (api_key_file) {
+			char *k = read_key_file(api_key_file);
+			if (!k) {
+				fprintf(stderr, "Error: %s not found\n", api_key_file);
+				return 1;
 			}
-			/* api_key_file from config: verify it exists */
-			if (api_key_file) {
-				char buf[512];
-				if (api_key_file[0] == '/')
-					snprintf(buf, sizeof(buf), "%s", api_key_file);
-				else
-					snprintf(buf, sizeof(buf), "%s/%s", home, api_key_file);
-				char *k = read_file_trimmed(buf);
+			free(k);
+		} else {
+			struct model_config *mc = find_model(model);
+			if (mc && mc->api_key_file) {
+				char *k = read_key_file(mc->api_key_file);
 				if (!k) {
-					fprintf(stderr, "Error: %s not found\n", buf);
+					fprintf(stderr, "Error: %s not found (from [%s] api_key_file)\n",
+						mc->api_key_file, mc->section);
 					return 1;
 				}
 				free(k);
+			} else if (!mc || !mc->api_key) {
+				/* Auto-detect: check the default key file for this model prefix */
+				const char *want = strncmp(model, "deepseek-", 9) == 0
+					? "~/.deepseek_api_key" : "~/.anthropic_api_key";
+				const char *k = strncmp(model, "deepseek-", 9) == 0
+					? deepseek_api_key : anthropic_api_key;
+				if (!k) {
+					fprintf(stderr, "Error: %s not found (model %s requires it)\n",
+						want, model);
+					fprintf(stderr, "Use --api-key FILE or configure [%s] in ~/.config/ytran/models\n",
+						find_model(model) ? find_model(model)->section : "pro");
+					return 1;
+				}
 			}
 		}
 	}

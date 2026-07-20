@@ -26,50 +26,74 @@ Failed downloads are re-queued at the back of the list (circular queue)
 and retried until 4 consecutive failures at the backoff ceiling.
 .SH CONFIGURATION
 .PP
-The file
+Configuration lives in
+.I $XDG_CONFIG_HOME/ytran/
+(default
+.IR ~/.config/ytran/ ).
+.SS Main config
+.PP
 .I ~/.config/ytran/config
-(respects
-.BR $XDG_CONFIG_HOME )
-sets default model, endpoint, and API key.
-Format is simple
-.IR "key = value" ,
-one per line.
-Lines starting with
-.B #
-are comments.
-.PP
-Supported keys:
-.TP
-.B model
-Default model name (e.g.,
-.BR deepseek-v4-pro ).
-Overridden by
-.B \-\-model
-and model shortcut flags.
-.TP
-.B endpoint
-API endpoint URL.
-Auto-detected from model prefix if not set.
-.TP
-.B api_key
-Raw API key string (takes precedence over
-.BR api_key_file ).
-.TP
-.B api_key_file
-Path to a file containing the API key.
-Relative paths are resolved against
-.BR $HOME .
-.PP
-CLI flags override config file values.
-.PP
-Example (switch default to DeepSeek):
+sets the default model:
 .PP
 .RS
 .nf
-\fB# ~/.config/ytran/config
-model = deepseek-v4-pro\fR
+\fBdefault = pro\fR
 .fi
 .RE
+.PP
+The value is a section name from the models file (see below).
+If absent, the compiled default
+.RB ( claude-sonnet-4-6 )
+is used.
+.SS Model definitions
+.PP
+.I ~/.config/ytran/models
+defines each model in INI-style sections:
+.PP
+.RS
+.nf
+\fB[pro]
+name = deepseek-v4-pro
+endpoint = https://api.deepseek.com/anthropic/v1/messages
+api_key_file = .deepseek_api_key
+input_price = 0.55
+output_price = 2.19
+
+[sonnet]
+name = claude-sonnet-4-6
+api_key_file = .anthropic_api_key
+input_price = 3.0
+output_price = 15.0\fR
+.fi
+.RE
+.PP
+Fields per section:
+.TP
+.B name
+Full model string sent to the API (defaults to section name).
+.TP
+.B endpoint
+API endpoint URL (auto-detected from name prefix if absent:
+.B deepseek-
+→ DeepSeek,
+.B claude-
+→ Anthropic).
+.TP
+.B api_key
+Raw API key string.
+.TP
+.B api_key_file
+Path to key file (resolved against
+.B $HOME
+if relative).
+.TP
+.B input_price ", " cache_write_price ", " cache_read_price ", " output_price
+Pricing in $/MTok for cost tracking (falls back to compiled defaults).
+.PP
+All fields are optional.
+CLI flags
+.RB ( \-\-model ", " \-\-api-key )
+override config values.
 .SH OPTIONS
 .TP
 .BR \-b ", " \-\-browse
@@ -221,9 +245,11 @@ Anthropic API key (used when model starts with
 .BR claude- ).
 .TP
 .I ~/.config/ytran/config
-Configuration file (respects
-.BR $XDG_CONFIG_HOME ).
-Sets default model, endpoint, and API key.
+Sets the default model
+.RI ( "default = pro" ).
+.TP
+.I ~/.config/ytran/models
+INI-style model definitions (endpoint, key, pricing per model).
 .SH DATABASE
 The database at
 .I ~/.local/share/ytran/youtube-transcripts.db
