@@ -1,5 +1,7 @@
 # ytran
 
+[github.com/moebiusV/ytran](https://github.com/moebiusV/ytran) | `git clone https://github.com/moebiusV/ytran`
+
 YouTube transcript fetcher and summarizer.
 
 Fetches YouTube video transcripts via transcriptapi.com, cleans them up with
