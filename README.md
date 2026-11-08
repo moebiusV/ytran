@@ -1,6 +1,6 @@
 # ytran
 
-[github.com/moebiusV/ytran](https://github.com/moebiusV/ytran) | `git clone https://github.com/moebiusV/ytran`
+[up](https://moebiusv.github.io/) | [github.com/moebiusV/ytran](https://github.com/moebiusV/ytran) | `git clone https://github.com/moebiusV/ytran`
 
 YouTube transcript fetcher and summarizer.
 
