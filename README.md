@@ -1,6 +1,6 @@
 # ytran
 
-Index: [All Projects](https://moebiusv.github.io/) | Git Repository: [github.com/moebiusV/ytran](https://github.com/moebiusV/ytran) | `git clone https://github.com/moebiusV/ytran`
+Parent: [All Projects](https://moebiusv.github.io/) | Git Repo: [github.com/moebiusV/ytran](https://github.com/moebiusV/ytran) | `git clone https://github.com/moebiusV/ytran`
 
 YouTube transcript fetcher and summarizer.
 
